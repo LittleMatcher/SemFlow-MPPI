@@ -19,7 +19,7 @@
 
 from abc import abstractmethod
 import torch
-from typing import Callable, Tuple, Optional, Dict, Any
+from typing import Callable, Tuple, Optional, Dict, Any, List
 from cfm_flowmp.interfaces import ODESolver
 
 
@@ -44,41 +44,41 @@ class DormandPrince45Solver(ODESolver):
     
     def solve(
         self,
-        vector_field: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-        initial_state: torch.Tensor,
-        t_span: Tuple[float, float],
-        t_eval: Optional[torch.Tensor] = None,
+        velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        x_0: torch.Tensor,
+        t_span: List[float],
         **kwargs
     ) -> torch.Tensor:
         """
-        使用Dormand-Prince方法求解ODE
+        使用Dormand-Prince方法求解ODE (符合 ODESolver 接口)
         
         Args:
-            vector_field: 向量场函数 f(x, t)
-            initial_state: 初始状态
-            t_span: 时间范围 (t_start, t_end)
-            t_eval: 输出时间点
-            **kwargs: 其他参数
-        
-        Returns:
-            形状为 (len(t_eval), *initial_state.shape) 的轨迹张量
+            velocity_fn: 向量场函数 f(x, t)
+            x_0: 初始状态
+            t_span: 时间点列表
+            **kwargs: 可含 t_eval 等
         """
+        t_eval = kwargs.get('t_eval', None)
         if t_eval is None:
-            t_eval = torch.linspace(t_span[0], t_span[1], 100, 
-                                   device=initial_state.device)
+            t_eval = torch.linspace(t_span[0], t_span[-1], 100, 
+                                   device=x_0.device)
         
-        trajectory = [initial_state.unsqueeze(0)]
-        current_state = initial_state.clone()
-        current_t = t_span[0]
+        trajectory = [x_0.unsqueeze(0)]
+        current_state = x_0.clone()
+        current_t = float(t_span[0])
         
         for target_t in t_eval[1:]:
             dt = target_t - current_t
-            current_state = self.step(vector_field, current_state, 
+            current_state = self.step(velocity_fn, current_state, 
                                      current_t, dt, **kwargs)
             trajectory.append(current_state.unsqueeze(0))
             current_t = target_t
         
         return torch.cat(trajectory, dim=0)
+    
+    def get_name(self) -> str:
+        """返回求解器名称"""
+        return "DormandPrince45"
     
     def step(
         self,
@@ -152,8 +152,10 @@ class ParametricFlowLoss(LossFunction):
             reduction: 'mean' 或 'sum'
             weight: 损失权重
         """
+        super().__init__()
         self.reduction = reduction
         self.weight = weight
+        self._last_component_losses: Dict[str, float] = {}
     
     def compute_loss(
         self,
@@ -174,7 +176,36 @@ class ParametricFlowLoss(LossFunction):
         """
         loss = torch.nn.functional.mse_loss(predictions, targets, 
                                             reduction=self.reduction)
-        return self.weight * loss
+        out = self.weight * loss
+        self._last_component_losses = {"total": out.item()}
+        return out
+    
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: Dict[str, torch.Tensor],
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        计算损失 (LossFunction 接口)
+        
+        Args:
+            pred: 模型预测
+            target: 目标字典，需包含与 pred 对应的目标张量
+            **kwargs: 其他参数
+        
+        Returns:
+            标量损失值
+        """
+        # 若 target 为字典，取常用键
+        t = target.get("target", target.get("targets", pred))
+        if isinstance(t, dict):
+            t = t.get("positions", pred)
+        return self.compute_loss(pred, t, **kwargs)
+    
+    def get_component_losses(self) -> Dict[str, float]:
+        """获取各分量损失"""
+        return dict(self._last_component_losses)
     
     def __call__(
         self,
@@ -274,6 +305,10 @@ class TrajectoryLengthMetric(Metric):
     
     计算轨迹的总长度（所有段的和）
     """
+    
+    def get_name(self) -> str:
+        """返回指标名称"""
+        return "trajectory_length"
     
     def compute(
         self,
@@ -404,7 +439,7 @@ def example_usage():
     trajectory = solver.solve(
         simple_vector_field,
         initial_state,
-        t_span=(0, 1),
+        t_span=[0.0, 1.0],
         t_eval=torch.linspace(0, 1, 10)
     )
     print(f"   - 轨迹形状: {trajectory.shape}")

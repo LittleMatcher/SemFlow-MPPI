@@ -100,7 +100,7 @@ class TestInterfaceChecker:
         
         assert 'class' in template
         assert 'def solve' in template
-        assert 'def step' in template
+        assert 'def get_name' in template
     
     def test_interface_report_generation(self):
         """应该能生成接口报告"""
@@ -196,14 +196,14 @@ class TestInterfaceRegistry:
         """应该能注册实现"""
         # 创建测试实现
         class TestSolver(ODESolver):
+            def get_name(self) -> str:
+                return "TestSolver"
+            
             def solve(self, vector_field, initial_state, t_span, **kwargs):
                 return initial_state.unsqueeze(0)
-            
-            def step(self, vector_field, state, t, dt, **kwargs):
-                return state
         
-        # 注册
-        InterfaceRegistry.register_implementation(TestSolver)
+        # 注册 (interface_name, impl_class)
+        InterfaceRegistry.register_implementation('ODESolver', TestSolver)
         
         # 检查是否注册
         impls = InterfaceRegistry.get_implementations('ODESolver')
