@@ -45,8 +45,8 @@ def load_model(checkpoint_path, device):
     """Load trained L2 model."""
     print(f"Loading model from {checkpoint_path}...")
     
-    # Create model
-    config = L2Config(
+    # Create model (same config as train_l2_mock)
+    model = create_l2_safety_cfm(
         model_type='transformer',
         state_dim=2,
         max_seq_len=64,
@@ -55,12 +55,11 @@ def load_model(checkpoint_path, device):
         num_heads=8,
         cost_map_channels=1,
         cost_map_latent_dim=256,
+        cost_map_encoder_type='single_scale',
         use_style_conditioning=True,
         style_dim=2,
         use_8step_schedule=True,
     )
-    
-    model = create_l2_safety_cfm(config=config)
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)

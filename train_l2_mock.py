@@ -19,7 +19,7 @@ from tqdm import tqdm
 
 from cfm_flowmp.data import MockL3Dataset, FlowMPEnvDataset, create_l2_dataloaders
 from cfm_flowmp.models import create_l2_safety_cfm, L2Config
-from cfm_flowmp.training import FlowMatchingLoss, FlowInterpolator
+from cfm_flowmp.training import FlowMatchingLoss, FlowMatchingConfig, FlowInterpolator
 
 
 def parse_args():
@@ -129,7 +129,7 @@ def create_datasets_and_loaders(args):
 
 def create_model(args):
     """Create L2 model."""
-    config = L2Config(
+    model = create_l2_safety_cfm(
         model_type=args.model_type,
         state_dim=2,
         max_seq_len=args.seq_len,
@@ -143,8 +143,6 @@ def create_model(args):
         style_dim=2,  # [w_safe, w_fast]
         use_8step_schedule=True,
     )
-    
-    model = create_l2_safety_cfm(config=config)
     return model
 
 
@@ -178,14 +176,14 @@ def train_epoch(model, train_loader, optimizer, flow_interpolator, loss_fn, devi
         
         # Interpolate trajectory (flow matching)
         interpolated = flow_interpolator.interpolate_trajectory(
-            trajectories=full_trajectory[:, :, :2],    # positions [B, T, 2]
-            velocities=full_trajectory[:, :, 2:4],     # velocities [B, T, 2]
-            accelerations=full_trajectory[:, :, 4:],   # accelerations [B, T, 2]
-            t=t,
+            q_1=full_trajectory[:, :, :2],    # positions [B, T, 2]
+            q_dot_1=full_trajectory[:, :, 2:4],     # velocities [B, T, 2]
+            q_ddot_1=full_trajectory[:, :, 4:],   # accelerations [B, T, 2]
+            t=t.squeeze(-1),
         )
         
-        x_t = interpolated['interpolated_state']      # [B, T, 6]
-        target_u = interpolated['target_velocity_field']  # [B, T, 6]
+        x_t = interpolated['x_t']      # [B, T, 6]
+        target_u = interpolated['target']  # [B, T, 6]
         
         # Forward pass
         t_flat = t.squeeze(-1)  # [B]
@@ -198,8 +196,14 @@ def train_epoch(model, train_loader, optimizer, flow_interpolator, loss_fn, devi
             w_style=style_weights,
         )
         
-        # Compute loss
-        loss_dict = loss_fn(predicted_u, target_u)
+        # Compute loss (FlowMatchingLoss returns 'loss', 'loss_vel', 'loss_acc', 'loss_jerk')
+        raw = loss_fn(predicted_u, target_u)
+        loss_dict = {
+            'total_loss': raw['loss'],
+            'position_loss': raw['loss_vel'],
+            'velocity_loss': raw['loss_acc'],
+            'acceleration_loss': raw['loss_jerk'],
+        }
         loss = loss_dict['total_loss']
         
         # Backward pass
@@ -261,14 +265,14 @@ def validate(model, val_loader, flow_interpolator, loss_fn, device):
         
         # Interpolate
         interpolated = flow_interpolator.interpolate_trajectory(
-            trajectories=full_trajectory[:, :, :2],
-            velocities=full_trajectory[:, :, 2:4],
-            accelerations=full_trajectory[:, :, 4:],
-            t=t,
+            q_1=full_trajectory[:, :, :2],
+            q_dot_1=full_trajectory[:, :, 2:4],
+            q_ddot_1=full_trajectory[:, :, 4:],
+            t=t.squeeze(-1),
         )
         
-        x_t = interpolated['interpolated_state']
-        target_u = interpolated['target_velocity_field']
+        x_t = interpolated['x_t']
+        target_u = interpolated['target']
         
         # Forward pass
         t_flat = t.squeeze(-1)
@@ -282,7 +286,13 @@ def validate(model, val_loader, flow_interpolator, loss_fn, device):
         )
         
         # Compute loss
-        loss_dict = loss_fn(predicted_u, target_u)
+        raw = loss_fn(predicted_u, target_u)
+        loss_dict = {
+            'total_loss': raw['loss'],
+            'position_loss': raw['loss_vel'],
+            'velocity_loss': raw['loss_acc'],
+            'acceleration_loss': raw['loss_jerk'],
+        }
         
         total_loss += loss_dict['total_loss'].item()
         total_pos_loss += loss_dict['position_loss'].item()
@@ -356,12 +366,9 @@ def main():
     )
     
     # Create flow interpolator and loss
-    flow_interpolator = FlowInterpolator(state_dim=2)
-    loss_fn = FlowMatchingLoss(
-        lambda_vel=1.0,
-        lambda_acc=1.0,
-        lambda_jerk=1.0,
-    )
+    flow_config = FlowMatchingConfig(lambda_vel=1.0, lambda_acc=1.0, lambda_jerk=1.0)
+    flow_interpolator = FlowInterpolator(flow_config)
+    loss_fn = FlowMatchingLoss(flow_config)
     
     # Resume from checkpoint if specified
     start_epoch = 0
