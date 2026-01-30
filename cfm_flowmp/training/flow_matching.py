@@ -235,21 +235,17 @@ class FlowInterpolator:
         q_ddot_t = t_expanded * q_ddot_1 + (1 - t_expanded) * epsilon_q_ddot
         
         # ============ Compute Target Fields ============
-        # u_target = (q_1 - q_t) / (1 - t) = (q_1 - epsilon_q)
-        # v_target = (q_dot_1 - q_dot_t) / (1 - t) = (q_dot_1 - epsilon_q_dot)
-        # w_target = (q_ddot_1 - q_ddot_t) / (1 - t) = (q_ddot_1 - epsilon_q_ddot)
+        # According to the implementation strategy, we use the form:
+        # u_target = (q_1 - q_t) / (1 - t)
+        # v_target = (q_dot_1 - q_dot_t) / (1 - t)
+        # w_target = (q_ddot_1 - q_ddot_t) / (1 - t)
+        # This form is more numerically stable and matches the ODE formulation
         
-        # For numerical stability, we can use either form
-        # Using the direct form: target = x_1 - x_0
-        u_target = q_1 - epsilon_q
-        v_target = q_dot_1 - epsilon_q_dot
-        w_target = q_ddot_1 - epsilon_q_ddot
-        
-        # Alternatively, using (x_1 - x_t) / (1 - t):
-        # eps = 1e-6
-        # u_target = (q_1 - q_t) / (1 - t_expanded + eps)
-        # v_target = (q_dot_1 - q_dot_t) / (1 - t_expanded + eps)
-        # w_target = (q_ddot_1 - q_ddot_t) / (1 - t_expanded + eps)
+        # Add small epsilon to avoid division by zero at t=1
+        eps = 1e-6
+        u_target = (q_1 - q_t) / (1 - t_expanded + eps)
+        v_target = (q_dot_1 - q_dot_t) / (1 - t_expanded + eps)
+        w_target = (q_ddot_1 - q_ddot_t) / (1 - t_expanded + eps)
         
         # ============ Concatenate for Network Input/Output ============
         # Input state: [pos, vel, acc] -> [B, T, 6]

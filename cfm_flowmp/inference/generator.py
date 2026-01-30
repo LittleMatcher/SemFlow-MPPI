@@ -24,6 +24,12 @@ class GeneratorConfig:
     solver_type: str = "rk4"
     num_steps: int = 20
     
+    # Custom time schedule (overrides num_steps if provided)
+    # Example: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0] for 8-step schedule
+    # This non-uniform schedule uses larger steps early and smaller steps near t=1
+    # for better fine-grained control in the refinement phase
+    time_schedule: Optional[List[float]] = None
+    
     # State dimensions
     state_dim: int = 2
     seq_len: int = 64
@@ -239,6 +245,7 @@ class TrajectoryGenerator:
         # Create ODE solver
         solver_config = SolverConfig(
             num_steps=self.config.num_steps,
+            time_schedule=self.config.time_schedule,
             return_trajectory=False,
         )
         self.solver = create_solver(self.config.solver_type, solver_config)
@@ -488,6 +495,19 @@ class TrajectoryGenerator:
                 results.append(result)
         
         return results
+
+
+def create_8step_schedule() -> List[float]:
+    """
+    Create the 8-step non-uniform time schedule as specified in the implementation strategy.
+    
+    This schedule uses larger steps early (coarse generation) and smaller steps
+    near t=1 (fine-grained refinement) to preserve more details in the final phase.
+    
+    Returns:
+        List of time values: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+    """
+    return [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 
 
 def compute_trajectory_metrics(
