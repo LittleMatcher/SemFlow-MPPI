@@ -121,6 +121,14 @@ python inference.py \
     --goal 2,2 \
     --solver rk4 \
     --num_steps 50
+
+# Using 8-step non-uniform schedule (recommended for fast inference)
+python inference.py \
+    --checkpoint checkpoints/best_model.pt \
+    --start 0,0 \
+    --goal 2,2 \
+    --solver rk4 \
+    --use_8step_schedule
 ```
 
 ## API Usage
@@ -173,13 +181,22 @@ checkpoint = torch.load("checkpoints/best_model.pt")
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
-# Create generator
+# Create generator with 8-step non-uniform schedule (recommended)
+from cfm_flowmp.inference.generator import create_8step_schedule
+
 gen_config = GeneratorConfig(
     solver_type="rk4",
-    num_steps=20,
+    time_schedule=create_8step_schedule(),  # Use 8-step schedule: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
     use_bspline_smoothing=True,
 )
 generator = TrajectoryGenerator(model, gen_config)
+
+# Or use uniform steps (traditional approach)
+gen_config_uniform = GeneratorConfig(
+    solver_type="rk4",
+    num_steps=20,  # Uniform 20 steps
+    use_bspline_smoothing=True,
+)
 
 # Generate trajectories
 start_pos = torch.tensor([[0.0, 0.0]])
@@ -208,17 +225,26 @@ For each training step:
    - $q_t = t \cdot q_1 + (1-t) \cdot \epsilon_q$
    - $\dot{q}_t = t \cdot \dot{q}_1 + (1-t) \cdot \epsilon_{\dot{q}}$
    - $\ddot{q}_t = t \cdot \ddot{q}_1 + (1-t) \cdot \epsilon_{\ddot{q}}$
-5. **Compute target fields**:
-   - $u_{\text{target}} = q_1 - \epsilon_q$
-   - $v_{\text{target}} = \dot{q}_1 - \epsilon_{\dot{q}}$
-   - $w_{\text{target}} = \ddot{q}_1 - \epsilon_{\ddot{q}}$
+5. **Compute target fields** (using interpolated states):
+   - $u_{\text{target}} = (q_1 - q_t) / (1-t)$
+   - $v_{\text{target}} = (\dot{q}_1 - \dot{q}_t) / (1-t)$
+   - $w_{\text{target}} = (\ddot{q}_1 - \ddot{q}_t) / (1-t)$
 6. **Forward pass**: $(\hat{u}, \hat{v}, \hat{w}) = \text{Model}(x_t, t, c)$
 7. **Compute loss**: $L = \|\hat{u} - u_{\text{target}}\|^2 + \lambda_{\text{acc}}\|\hat{v} - v_{\text{target}}\|^2 + \lambda_{\text{jerk}}\|\hat{w} - w_{\text{target}}\|^2$
 
 ### ODE Integration (Inference)
 
 1. **Initialize** $x_0 \sim \mathcal{N}(0, I)$
-2. **Integrate** from $t=0$ to $t=1$ using RK4:
+2. **Integrate** from $t=0$ to $t=1$ using RK4 with time schedule:
+   
+   **8-Step Non-Uniform Schedule** (Recommended):
+   ```
+   Time steps: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+   ```
+   This schedule uses larger steps early (coarse generation) and smaller steps 
+   near $t=1$ (fine-grained refinement) to preserve details in the final phase.
+   
+   **Uniform Schedule** (Traditional):
    ```
    for t in [0, dt, 2*dt, ..., 1]:
        k1 = model(x, t, c)
@@ -314,7 +340,8 @@ Input: x_t [B, T, 6] (position, velocity, acceleration)
 | warmup_steps | 1000 | LR warmup steps |
 | lambda_acc | 1.0 | Acceleration loss weight |
 | lambda_jerk | 1.0 | Jerk loss weight |
-| num_steps (inference) | 20 | ODE integration steps |
+| num_steps (inference) | 20 | ODE integration steps (uniform) |
+| time_schedule (inference) | None | Custom time schedule (e.g., 8-step: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]) |
 
 ## Data Format
 

@@ -15,6 +15,7 @@ Available solvers:
 import torch
 import torch.nn as nn
 from typing import Callable, Optional, Tuple, List
+from dataclasses import field
 from dataclasses import dataclass
 
 
@@ -28,6 +29,10 @@ class SolverConfig:
     # Time range
     t_start: float = 0.0
     t_end: float = 1.0
+    
+    # Custom time schedule (overrides num_steps if provided)
+    # Example: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0] for 8-step schedule
+    time_schedule: Optional[List[float]] = field(default=None)
     
     # For adaptive solvers
     atol: float = 1e-5
@@ -120,24 +125,54 @@ class RK4Solver:
         """
         Solve ODE using RK4 method.
         
+        Supports both uniform time steps and custom time schedules.
+        If time_schedule is provided in config, it will be used instead of uniform steps.
+        
         Args:
             velocity_fn: Function v(x, t) returning velocity at state x and time t
             x_0: Initial state [B, T, D] or [B, D]
-            num_steps: Number of integration steps (overrides config)
+            num_steps: Number of integration steps (overrides config, ignored if time_schedule is set)
             
         Returns:
             Final state x_1 at t=1, or trajectory if return_trajectory=True
         """
-        num_steps = num_steps or self.config.num_steps
-        dt = (self.config.t_end - self.config.t_start) / num_steps
-        
         x = x_0.clone()
         B = x_0.shape[0]
-        t = torch.full((B,), self.config.t_start, device=x_0.device, dtype=x_0.dtype)
+        device = x_0.device
+        dtype = x_0.dtype
         
+        # Use custom time schedule if provided
+        if self.config.time_schedule is not None:
+            time_schedule = self.config.time_schedule
+            # Ensure schedule starts at t_start and ends at t_end
+            if time_schedule[0] != self.config.t_start:
+                time_schedule = [self.config.t_start] + time_schedule
+            if time_schedule[-1] != self.config.t_end:
+                time_schedule = time_schedule + [self.config.t_end]
+            time_schedule = torch.tensor(time_schedule, device=device, dtype=dtype)
+        else:
+            # Uniform time steps
+            num_steps = num_steps or self.config.num_steps
+            time_schedule = torch.linspace(
+                self.config.t_start,
+                self.config.t_end,
+                num_steps + 1,
+                device=device,
+                dtype=dtype
+            )
+        
+        t = torch.full((B,), time_schedule[0].item(), device=device, dtype=dtype)
         trajectory = [x.clone()] if self.config.return_trajectory else None
         
-        for step in range(num_steps):
+        # Integrate over each time interval
+        for i in range(len(time_schedule) - 1):
+            t_curr = time_schedule[i]
+            t_next = time_schedule[i + 1]
+            dt = t_next - t_curr
+            
+            # Update t for all samples in batch
+            t = torch.full((B,), t_curr.item(), device=device, dtype=dtype)
+            
             # RK4 stages
             k1 = velocity_fn(x, t)
             k2 = velocity_fn(x + 0.5 * dt * k1, t + 0.5 * dt)
@@ -146,7 +181,6 @@ class RK4Solver:
             
             # Update state
             x = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-            t = t + dt
             
             if trajectory is not None:
                 trajectory.append(x.clone())
