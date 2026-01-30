@@ -189,7 +189,15 @@ class FlowInterpolator:
         Construct interpolated trajectory state at flow time t.
         
         Implements the FlowMP interpolation for position, velocity,
-        and acceleration simultaneously.
+        and acceleration simultaneously (Eq. 6, 8, 10).
+        
+        The interpolation follows the optimal transport path:
+            x_t = t * x_1 + (1 - t) * epsilon
+        
+        And the target velocity field is:
+            u_target = (x_1 - x_t) / (1 - t)
+        
+        Note: For t close to 1, we use numerical stabilization.
         
         Args:
             q_1: Target position trajectory [B, T, state_dim]
@@ -235,6 +243,7 @@ class FlowInterpolator:
         q_ddot_t = t_expanded * q_ddot_1 + (1 - t_expanded) * epsilon_q_ddot
         
         # ============ Compute Target Fields ============
+<<<<<<< Current (Your changes)
         # According to the implementation strategy, we use the form:
         # u_target = (q_1 - q_t) / (1 - t)
         # v_target = (q_dot_1 - q_dot_t) / (1 - t)
@@ -246,6 +255,27 @@ class FlowInterpolator:
         u_target = (q_1 - q_t) / (1 - t_expanded + eps)
         v_target = (q_dot_1 - q_dot_t) / (1 - t_expanded + eps)
         w_target = (q_ddot_1 - q_ddot_t) / (1 - t_expanded + eps)
+=======
+        # According to FlowMP Algorithm 1:
+        # u_target = (q_1 - q_t) / (1 - t)
+        # v_target = (q_dot_1 - q_dot_t) / (1 - t)
+        # w_target = (q_ddot_1 - q_ddot_t) / (1 - t)
+        #
+        # Note: Since q_t = t * q_1 + (1-t) * epsilon,
+        #       (q_1 - q_t) / (1-t) = (q_1 - t*q_1 - (1-t)*epsilon) / (1-t)
+        #                          = ((1-t)*q_1 - (1-t)*epsilon) / (1-t)
+        #                          = q_1 - epsilon
+        # Both forms are mathematically equivalent, but we use the explicit
+        # form (x_1 - x_t) / (1-t) for numerical consistency with the paper.
+        
+        # Small epsilon to avoid division by zero when t is close to 1
+        eps = 1e-5
+        one_minus_t = (1 - t_expanded).clamp(min=eps)
+        
+        u_target = (q_1 - q_t) / one_minus_t
+        v_target = (q_dot_1 - q_dot_t) / one_minus_t
+        w_target = (q_ddot_1 - q_ddot_t) / one_minus_t
+>>>>>>> Incoming (Background Agent changes)
         
         # ============ Concatenate for Network Input/Output ============
         # Input state: [pos, vel, acc] -> [B, T, 6]
@@ -266,6 +296,7 @@ class FlowInterpolator:
             'epsilon_q': epsilon_q,
             'epsilon_q_dot': epsilon_q_dot,
             'epsilon_q_ddot': epsilon_q_ddot,
+            't': t,
         }
 
 

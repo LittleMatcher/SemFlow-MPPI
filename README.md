@@ -121,14 +121,6 @@ python inference.py \
     --goal 2,2 \
     --solver rk4 \
     --num_steps 50
-
-# Using 8-step non-uniform schedule (recommended for fast inference)
-python inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --start 0,0 \
-    --goal 2,2 \
-    --solver rk4 \
-    --use_8step_schedule
 ```
 
 ## API Usage
@@ -181,22 +173,13 @@ checkpoint = torch.load("checkpoints/best_model.pt")
 model.load_state_dict(checkpoint['model_state_dict'])
 model.eval()
 
-# Create generator with 8-step non-uniform schedule (recommended)
-from cfm_flowmp.inference.generator import create_8step_schedule
-
+# Create generator
 gen_config = GeneratorConfig(
     solver_type="rk4",
-    time_schedule=create_8step_schedule(),  # Use 8-step schedule: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+    num_steps=20,
     use_bspline_smoothing=True,
 )
 generator = TrajectoryGenerator(model, gen_config)
-
-# Or use uniform steps (traditional approach)
-gen_config_uniform = GeneratorConfig(
-    solver_type="rk4",
-    num_steps=20,  # Uniform 20 steps
-    use_bspline_smoothing=True,
-)
 
 # Generate trajectories
 start_pos = torch.tensor([[0.0, 0.0]])
@@ -221,63 +204,65 @@ For each training step:
 1. **Sample** expert trajectory $(q_1, \dot{q}_1, \ddot{q}_1)$ from dataset
 2. **Sample** flow time $t \sim \text{Uniform}(0, 1)$
 3. **Sample** noise $\epsilon_q, \epsilon_{\dot{q}}, \epsilon_{\ddot{q}} \sim \mathcal{N}(0, I)$
-4. **Interpolate** states:
+4. **Interpolate** states (Eq. 6, 8, 10):
    - $q_t = t \cdot q_1 + (1-t) \cdot \epsilon_q$
    - $\dot{q}_t = t \cdot \dot{q}_1 + (1-t) \cdot \epsilon_{\dot{q}}$
    - $\ddot{q}_t = t \cdot \ddot{q}_1 + (1-t) \cdot \epsilon_{\ddot{q}}$
-5. **Compute target fields** (using interpolated states):
+5. **Compute target fields** (as per FlowMP Algorithm 1):
    - $u_{\text{target}} = (q_1 - q_t) / (1-t)$
    - $v_{\text{target}} = (\dot{q}_1 - \dot{q}_t) / (1-t)$
    - $w_{\text{target}} = (\ddot{q}_1 - \ddot{q}_t) / (1-t)$
-6. **Forward pass**: $(\hat{u}, \hat{v}, \hat{w}) = \text{Model}(x_t, t, c)$
+6. **Forward pass**: Tokenize $\{q_t, \dot{q}_t, \ddot{q}_t\}$, input to Transformer with $t$ and $c$
 7. **Compute loss**: $L = \|\hat{u} - u_{\text{target}}\|^2 + \lambda_{\text{acc}}\|\hat{v} - v_{\text{target}}\|^2 + \lambda_{\text{jerk}}\|\hat{w} - w_{\text{target}}\|^2$
 
-### ODE Integration (Inference)
+### ODE Integration (Inference with 8-Step Schedule)
+
+Following "Unified Generation-Refinement Planning", we use a non-uniform time schedule for faster inference:
 
 1. **Initialize** $x_0 \sim \mathcal{N}(0, I)$
-2. **Integrate** from $t=0$ to $t=1$ using RK4 with time schedule:
-   
-   **8-Step Non-Uniform Schedule** (Recommended):
+2. **Time Schedule**: $t_{\text{steps}} = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]$
+   - Large steps early (exploration phase)
+   - Small steps near $t=1$ (refinement phase for detail preservation)
+3. **Integrate** using RK4 with variable step sizes:
    ```
-   Time steps: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
-   ```
-   This schedule uses larger steps early (coarse generation) and smaller steps 
-   near $t=1$ (fine-grained refinement) to preserve details in the final phase.
-   
-   **Uniform Schedule** (Traditional):
-   ```
-   for t in [0, dt, 2*dt, ..., 1]:
-       k1 = model(x, t, c)
-       k2 = model(x + dt/2 * k1, t + dt/2, c)
-       k3 = model(x + dt/2 * k2, t + dt/2, c)
-       k4 = model(x + dt * k3, t + dt, c)
+   for i in range(len(t_steps) - 1):
+       t_curr, t_next = t_steps[i], t_steps[i+1]
+       dt = t_next - t_curr
+       # RK4 update
+       k1 = model(x, t_curr, c)
+       k2 = model(x + dt/2 * k1, t_curr + dt/2, c)
+       k3 = model(x + dt/2 * k2, t_curr + dt/2, c)
+       k4 = model(x + dt * k3, t_next, c)
        x = x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
    ```
-3. **Extract** trajectory: $x_1 = (q_{\text{gen}}, \dot{q}_{\text{gen}}, \ddot{q}_{\text{gen}})$
-4. **Smooth** with B-splines for physical consistency
+4. **Extract** trajectory: $x_1 = (q_{\text{gen}}, \dot{q}_{\text{gen}}, \ddot{q}_{\text{gen}})$
+5. **Smooth** with B-splines to eliminate numerical drift
 
 ## Model Architecture
 
+Based on "Unified Generation-Refinement Planning" and FlowMP official implementation.
+
 ```
 Input: x_t [B, T, 6] (position, velocity, acceleration)
-       t [B] (flow time)
+       t [B] (flow time ∈ [0,1])
        c (start_pos, goal_pos, start_vel)
 
 ┌─────────────────────────────────────────┐
-│           Input Projection              │
+│      Trajectory Tokenizer (Linear)      │
 │         [B, T, 6] → [B, T, D]           │
+│            (D=256 recommended)          │
 └─────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│       Positional Encoding               │
-│        (Sinusoidal/Learned)             │
+│    Sinusoidal Positional Encoding       │
+│         (sequence positions)            │
 └─────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│     Gaussian Fourier Time Embedding     │
-│           t → [B, D]                    │
+│    Time Embedding (Sinusoidal/Fourier)  │
+│    t → [B, D], added to token embedding │
 └────────────────┬────────────────────────┘
                  │
                  │    ┌───────────────────┐
@@ -288,22 +273,25 @@ Input: x_t [B, T, 6] (position, velocity, acceleration)
                  ▼             ▼
          ┌──────────────────────────┐
          │   Combined Conditioning   │
-         │      [B, D] + [B, D]      │
+         │   (AdaLN / Cross-Attn /  │
+         │        Token Prepend)     │
          └────────────┬─────────────┘
                       │
         ┌─────────────┴─────────────┐
         │                           │
         ▼                           │
 ┌───────────────────────────────────┴─────┐
-│         Transformer Blocks (×L)          │
+│    Transformer Encoder Blocks (L=8)     │
 │  ┌────────────────────────────────────┐ │
 │  │     AdaLN (conditioned on t, c)    │ │
 │  │              ↓                     │ │
-│  │    Multi-Head Self-Attention       │ │
+│  │  Multi-Head Self-Attention (H=8)   │ │
+│  │              ↓                     │ │
+│  │   (Optional) Cross-Attention       │ │
 │  │              ↓                     │ │
 │  │     AdaLN (conditioned on t, c)    │ │
 │  │              ↓                     │ │
-│  │         Feed-Forward               │ │
+│  │     Feed-Forward (GeLU)            │ │
 │  └────────────────────────────────────┘ │
 └─────────────────────────────────────────┘
                     │
@@ -314,22 +302,28 @@ Input: x_t [B, T, 6] (position, velocity, acceleration)
                     │
                     ▼
 ┌─────────────────────────────────────────┐
-│           Output Head                   │
+│     Output Head (Unembedding)           │
 │       [B, T, D] → [B, T, 6]             │
-│   (u: vel field, v: acc field,         │
-│    w: jerk field)                       │
+│   (u: ṗ field, v: p̈ field,            │
+│    w: p⃛ field)                         │
 └─────────────────────────────────────────┘
 ```
+
+### Condition Injection Methods
+
+1. **AdaLN** (default): Time and condition modulate LayerNorm parameters
+2. **Cross-Attention**: Trajectory tokens attend to condition tokens
+3. **Token Prepending**: Condition encoded as prefix tokens
 
 ## Configuration
 
 ### Model Variants
 
-| Variant | Hidden Dim | Layers | Heads | Params |
-|---------|-----------|--------|-------|--------|
-| small   | 128       | 4      | 4     | ~3M    |
-| base    | 256       | 6      | 8     | ~12M   |
-| large   | 512       | 8      | 16    | ~50M   |
+| Variant | Hidden Dim | Layers | Heads | Params | Notes |
+|---------|-----------|--------|-------|--------|-------|
+| small   | 128       | 4      | 4     | ~3M    | Fast prototyping |
+| base    | 256       | 8      | 8     | ~15M   | Recommended (Mizuta et al.) |
+| large   | 512       | 12     | 16    | ~50M   | High capacity |
 
 ### Key Hyperparameters
 
@@ -340,8 +334,15 @@ Input: x_t [B, T, 6] (position, velocity, acceleration)
 | warmup_steps | 1000 | LR warmup steps |
 | lambda_acc | 1.0 | Acceleration loss weight |
 | lambda_jerk | 1.0 | Jerk loss weight |
-| num_steps (inference) | 20 | ODE integration steps (uniform) |
-| time_schedule (inference) | None | Custom time schedule (e.g., 8-step: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]) |
+| condition_type | "adaln" | Condition injection method |
+
+### Inference Time Schedule
+
+| Schedule | Steps | Description |
+|----------|-------|-------------|
+| 8-step (default) | `[0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]` | Fast inference with refinement |
+| uniform-10 | 10 equally spaced | Standard uniform stepping |
+| uniform-20 | 20 equally spaced | Higher accuracy |
 
 ## Data Format
 
@@ -366,10 +367,12 @@ If velocities/accelerations are not provided, they will be computed from positio
 
 ## References
 
-- **FlowMP**: Flow Matching for Motion Planning
+- **FlowMP**: [mkhangg/flow_mp](https://github.com/mkhangg/flow_mp) - Official FlowMP implementation
+- **Unified Generation-Refinement Planning**: Non-uniform ODE scheduling for efficient inference
 - **Conditional Flow Matching**: [Lipman et al., 2023](https://arxiv.org/abs/2210.02747)
 - **Rectified Flow**: [Liu et al., 2022](https://arxiv.org/abs/2209.03003)
 - **DiT (Diffusion Transformers)**: [Peebles & Xie, 2023](https://arxiv.org/abs/2212.09748)
+- **Mizuta et al.**: Transformer-based trajectory planning architecture guidelines
 
 ## License
 

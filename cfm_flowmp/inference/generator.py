@@ -22,7 +22,12 @@ class GeneratorConfig:
     
     # Solver settings
     solver_type: str = "rk4"
-    num_steps: int = 20
+    num_steps: int = 20  # Used for uniform stepping
+    
+    # Time schedule (as per "Unified Generation-Refinement Planning")
+    # Non-uniform schedule: large steps early, small steps near t=1
+    use_8step_schedule: bool = True  # Use aggressive 8-step schedule by default
+    custom_time_schedule: list = None  # Override with custom schedule
     
     # Custom time schedule (overrides num_steps if provided)
     # Example: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0] for 8-step schedule
@@ -34,13 +39,18 @@ class GeneratorConfig:
     state_dim: int = 2
     seq_len: int = 64
     
-    # Smoothing
+    # Smoothing (B-spline fitting for physical consistency)
     use_bspline_smoothing: bool = True
     bspline_degree: int = 3
     bspline_num_control_points: int = 20
     
     # Sampling
     num_samples: int = 1  # Number of trajectories to generate per condition
+
+
+# 8-step schedule from "Unified Generation-Refinement Planning"
+# Front-loaded: large steps early (exploration), small steps late (refinement)
+DEFAULT_8STEP_SCHEDULE = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 
 
 class BSplineSmoother:
@@ -242,15 +252,27 @@ class TrajectoryGenerator:
         self.model = model
         self.config = config or GeneratorConfig()
         
-        # Create ODE solver
+        # Determine time schedule
+        if self.config.custom_time_schedule is not None:
+            time_schedule = self.config.custom_time_schedule
+        elif self.config.use_8step_schedule:
+            time_schedule = DEFAULT_8STEP_SCHEDULE
+        else:
+            time_schedule = None  # Use uniform stepping
+        
+        # Create ODE solver with time schedule
         solver_config = SolverConfig(
             num_steps=self.config.num_steps,
             time_schedule=self.config.time_schedule,
             return_trajectory=False,
+            time_schedule=time_schedule,
+            use_8step_schedule=self.config.use_8step_schedule,
         )
         self.solver = create_solver(self.config.solver_type, solver_config)
+        self.time_schedule = time_schedule
         
-        # Create smoother
+        # Create B-spline smoother for physical consistency
+        # As per spec: "output smoothing via B-spline to eliminate numerical drift"
         if self.config.use_bspline_smoothing:
             self.smoother = BSplineSmoother(
                 degree=self.config.bspline_degree,
