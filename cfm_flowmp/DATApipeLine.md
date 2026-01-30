@@ -2391,6 +2391,59 @@ plt.show()
 
 ## 五、扩展功能
 
+### 5.0 数据集生成与 L2 训练/验证（参照 flow_mp-main）
+
+**数据生成**：使用 B-spline 生成 2D 轨迹（pos/vel/acc）并生成 cost_map，保存为 `.npz`。
+
+```bash
+# 生成数据（输出到 traj_data/cfm_env/data.npz）
+python -m cfm_flowmp.scripts.generate_data.generate_env_trajs_cfm \
+  --output_dir traj_data/cfm_env --num_trajs 500 --seq_len 64 --map_size 64
+```
+
+**DataLoader**：`cfm_flowmp.data` 提供 `FlowMPEnvDataset`（从 .npz 加载）与 `create_l2_dataloaders`。
+
+```python
+from cfm_flowmp.data import FlowMPEnvDataset, create_l2_dataloaders
+
+# 方式一：直接使用生成数据
+train_loader, val_loader = create_l2_dataloaders(
+    data_source="generated",
+    data_dir="traj_data/cfm_env",
+    batch_size=32,
+    train_ratio=0.9,
+    seed=42,
+)
+
+# 方式二：Mock 数据（无需预生成）
+train_loader, val_loader = create_l2_dataloaders(
+    data_source="mock",
+    num_train=5000,
+    num_val=500,
+    batch_size=32,
+    map_size=64,
+    seq_len=64,
+    style_mode="random",
+)
+```
+
+**训练**：`train_l2_mock.py` 支持 `--data_source mock|generated` 与 `--data_dir`。
+
+```bash
+# 使用 Mock 数据训练
+python train_l2_mock.py --num_samples 5000 --epochs 100 --batch_size 32
+
+# 使用生成数据训练
+python train_l2_mock.py --data_source generated --data_dir traj_data/cfm_env --epochs 100
+```
+
+**验证**：`validate_l2.py` 支持几何约束与风格可控性测试；可选使用生成数据中的 cost_map。
+
+```bash
+python validate_l2.py --checkpoint checkpoints_l2/best_model.pt --test_type all
+python validate_l2.py --checkpoint checkpoints_l2/best_model.pt --data_dir traj_data/cfm_env --save_plots
+```
+
 ### 5.1 自定义轨迹数据集
 
 ```python
