@@ -38,7 +38,305 @@ CFM FlowMP 是一个基于**条件流匹配（Conditional Flow Matching）**的�
 
 ---
 
+### L2层时间编码实现详解
+
+#### 时间编码的作用
+
+在条件流匹配（CFM）框架中，流时间 $t \in [0, 1]$ 是关键信息：
+- $t=0$：初始噪声状态
+- $t=1$：目标轨迹
+- $0<t<1$：插值路径上的中间状态
+
+时间编码的目的是**将标量时间映射到高维特征空间**，使模型能够：
+1. 感知当前位置在去噪过程中的进度
+2. 根据时间动态调整速度场预测
+3. 支持自适应层归一化（AdaLN）进行条件调制
+
+#### 两种时间编码方式
+
+##### **1. Fourier 编码（推荐，默认使用）**
+
+```
+时间t ∈ [0, 1]
+  ↓
+随机Fourier特征映射
+  ├─ 采样频率: W ~ N(0, σ²) [embed_dim]
+  ├─ 投影: t_proj = t · W · 2π
+  │        形状: [B, embed_dim]
+  │
+  ├─ 三角函数: 
+  │  ├─ sin(t_proj): [B, embed_dim]
+  │  └─ cos(t_proj): [B, embed_dim]
+  │
+  └─ 拼接+投影:
+     embedding = Linear(
+       concat([sin, cos]),
+       output_dim = time_embed_dim
+     )
+     形状: [B, time_embed_dim]
+```
+
+**实现代码**：
+```python
+class GaussianFourierProjection(nn.Module):
+    def __init__(self, embed_dim=256, scale=30.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.scale = scale
+        
+        # 随机频率（注册为buffer，不参与梯度计算）
+        W = torch.randn(embed_dim) * scale
+        self.register_buffer('W', W)
+        
+        # 输出投影
+        self.output_proj = nn.Linear(embed_dim * 2, embed_dim)
+    
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            t: [B] 或 [B, 1]，值在 [0, 1]
+        Returns:
+            [B, embed_dim]
+        """
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)  # [B] → [B, 1]
+        
+        # 映射到Fourier空间
+        t_proj = t * self.W[None, :] * 2 * math.pi  # [B, embed_dim]
+        
+        # 三角函数特征
+        embedding = torch.cat([
+            torch.sin(t_proj),  # [B, embed_dim]
+            torch.cos(t_proj),  # [B, embed_dim]
+        ], dim=-1)  # [B, embed_dim*2]
+        
+        # 投影回desired维度
+        return self.output_proj(embedding)  # [B, embed_dim]
+```
+
+**优势**：
+- ✓ 捕捉高频时间变化
+- ✓ 参数高效（只需random frequencies）
+- ✓ 泛化能力强
+
+##### **2. 正弦波位置编码**
+
+```
+时间t ∈ [0, 1]
+  ↓
+缩放: t' = t · 1000
+  ↓
+频率带生成
+  ├─ k = 0, 1, ..., embed_dim/2
+  ├─ freq_k = 10000^(-2k/embed_dim)
+  └─ 形状: [embed_dim/2]
+  ↓
+三角编码:
+  ├─ cos(t' · freq_k): [B, embed_dim/2]
+  └─ sin(t' · freq_k): [B, embed_dim/2]
+  ↓
+拼接+投影 → [B, embed_dim]
+```
+
+**实现代码**：
+```python
+class SinusoidalPositionalEncoding(nn.Module):
+    def __init__(self, embed_dim=256, max_period=10000.0):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_period = max_period
+        
+        # 预计算频率
+        half_dim = embed_dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * 
+            torch.arange(half_dim, dtype=torch.float32) / half_dim
+        )
+        self.register_buffer('freqs', freqs)
+        
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
+    
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            t: [B] 或 [B, 1]
+        Returns:
+            [B, embed_dim]
+        """
+        if t.dim() == 1:
+            t = t.unsqueeze(-1)  # [B, 1]
+        
+        # 缩放时间到更大范围以获得更好的频率覆盖
+        t = t * 1000.0  # [B, 1]
+        
+        # 计算三角函数特征
+        args = t * self.freqs[None, :]  # [B, half_dim]
+        embedding = torch.cat([
+            torch.cos(args),  # [B, half_dim]
+            torch.sin(args),  # [B, half_dim]
+        ], dim=-1)  # [B, embed_dim]
+        
+        return self.output_proj(embedding)
+```
+
+#### L2层中的时间编码集成
+
+```
+输入层：ODE求解过程中的流时间
+  │
+  ├─ t ~ [0, 0.05, 0.10, ..., 0.95, 1.00] (均匀调度)
+  │  或
+  ├─ t ~ [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0] (非均匀)
+  │
+  ↓
+【时间编码器】(GaussianFourier or Sinusoidal)
+  │
+  ├─ 输入: t [B]
+  ├─ 处理:
+  │  ├─ Fourier/Sinusoidal映射
+  │  ├─ 输出: time_emb [B, 256]
+  │  └─ 包含高频和低频时间信息
+  │
+  ↓
+【条件融合】
+  │
+  ├─ 来自L3的代价地图: e_map [B, 256]
+  ├─ 当前机器人状态: x_curr [B, 6]
+  ├─ 目标状态: x_goal [B, 4]
+  ├─ 控制风格: w_style [B, 3]
+  │
+  ├─ time_emb也作为条件的一部分参与融合
+  │
+  ↓
+【统一条件向量】: condition [B, hidden_dim]
+  │
+  ↓
+【适应层归一化 (AdaLN)】
+  │
+  └─ 使用time_emb调制Transformer/U-Net的每一层
+```
+
+#### Transformer中的时间编码使用流程
+
+```python
+# 在FlowMPTransformer.forward()中
+
+# 1️⃣ 时间编码
+time_emb = self.time_embed(t)  # [B] → [B, 256]
+
+# 2️⃣ 条件编码（包括start/goal位置）
+cond_emb = self.cond_encoder(
+    start_pos=start_pos,
+    goal_pos=goal_pos,
+    start_vel=start_vel,
+    goal_vel=goal_vel,
+    env_encoding=env_encoding,
+)  # [B, 256]
+
+# 3️⃣ 融合时间和条件信息
+if self.condition_type == "token":
+    # 方式A：将time_emb和cond_emb作为特殊token前置
+    time_token = self.cond_token_proj(time_emb)      # [B, hidden_dim]
+    cond_token = self.cond_token_proj(cond_emb)      # [B, hidden_dim]
+    
+    prefix_tokens = torch.stack([time_token, cond_token], dim=1)  # [B, 2, hidden_dim]
+    h = torch.cat([prefix_tokens, h], dim=1)  # [B, T+2, hidden_dim]
+
+else:  # condition_type == "adaLN"
+    # 方式B：通过AdaLN调制每一层
+    combined_cond = self.cond_combine(
+        torch.cat([time_emb, cond_emb], dim=-1)
+    )  # [B, hidden_dim]
+    
+    # 在Transformer块中使用
+    # 对于每一层:
+    #   x_norm = AdaLN(x, combined_cond)
+    #   ...
+
+# 4️⃣ Transformer编码
+for i, block in enumerate(self.transformer_blocks):
+    h = block(
+        h,
+        cond_embed=combined_cond,  # 传入条件
+        cross_attention_input=cross_attn_input,
+    )
+    # 每一层都使用time_emb提供的时间信息
+
+# 5️⃣ 输出预测向量场
+output = self.output_head(h)  # [B, T, 6]
+```
+
+#### 关键参数配置
+
+```python
+from cfm_flowmp.models import create_l2_safety_cfm
+
+# 时间编码配置示例
+
+# 方案1：Fourier编码（推荐）
+config1 = L2Config(
+    model_type="transformer",
+    hidden_dim=256,
+    num_layers=8,
+    num_heads=8,
+    # Transformer会自动创建GaussianFourierProjection
+    # 参数在transformer.py中配置
+)
+
+# 查看Transformer初始化中的时间编码参数
+model = FlowMPTransformer(
+    state_dim=2,
+    hidden_dim=256,
+    time_embed_type="fourier",  # 或 "sinusoidal"
+    time_embed_dim=256,         # Fourier投影的输出维度
+    embed_dim=256,              # 原始Fourier特征维度
+    scale=30.0,                 # 高斯随机频率的标准差
+)
+```
+
+#### 时间编码的效果验证
+
+```python
+# 可视化时间编码
+
+import torch
+import matplotlib.pyplot as plt
+from cfm_flowmp.models.embeddings import GaussianFourierProjection
+
+# 创建编码器
+encoder = GaussianFourierProjection(embed_dim=256, scale=30.0)
+
+# 生成时间点
+t_values = torch.linspace(0, 1, 100).unsqueeze(-1)  # [100, 1]
+
+# 编码
+embeddings = encoder(t_values)  # [100, 256]
+
+# 可视化：观察随时间变化的特征响应
+plt.figure(figsize=(12, 6))
+
+# 绘制不同特征在时间上的响应
+for i in [0, 50, 100, 150, 200]:
+    plt.plot(t_values.numpy(), embeddings[:, i].numpy(), 
+             label=f'Feature {i}')
+
+plt.xlabel('Flow Time (t)')
+plt.ylabel('Embedding Value')
+plt.title('Gaussian Fourier Projection Response over Time')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# 结果：看到不同特征以不同频率响应时间变化
+# - 低频特征：缓慢变化，全局时间进度
+# - 高频特征：快速振荡，细粒度时间信息
+```
+
+---
+
 ## 二、数据流详解
+
+### 2.0 L2层时间编码系统
 
 ### 2.1 训练阶段数据流
 
@@ -374,9 +672,9 @@ w_pred: torch.Size([32, 64, 2])
 【L3层：Vision-Language Model】
    │
    ├─ 输入：
-   │  ├─ RGB图像 / 深度图像 [B, 3, H_img, W_img]
+   │  ├─ 仿真图像
    │  ├─ 语言指令 (文本)
-   │  └─ 传感器数据（激光雷达、IMU等）
+   │  └─ 传感器数据（仿真）
    │
    ├─ 处理：
    │  ├─ 场景理解与语义分割
@@ -389,8 +687,7 @@ w_pred: torch.Size([32, 64, 2])
       │  ├─ C通道包含：
       │  │  ├─ 障碍物占用概率 [0, 1]
       │  │  ├─ 可通行性评分 [0, 1]
-      │  │  ├─ 风险等级 [0, 1]
-      │  │  └─ 其他语义信息...
+      │  │  └─ 风险等级 [0, 1]
       │  └─ 空间分辨率: H×W (如 64×64 或 128×128)
       │
       └─ 高级语义标签（可选）
@@ -2390,11 +2687,222 @@ CostMapEncoder:
 
 ---
 
-## 七、参考资源
+## 6.6 L2层时间编码高级主题
 
-### 论文和理论
+#### 时间编码的数学基础
 
-1. **Flow Matching**: "Flow Matching for Generative Modeling" (2023)
+**Flow Matching中的时间表示**：
+
+在条件流匹配中，流路径定义为：
+$$\phi_t(x_0, x_1) = t \cdot x_1 + (1-t) \cdot x_0, \quad t \in [0, 1]$$
+
+速度场的学习目标为：
+$$v_\theta(x_t, t) \approx x_1 - x_0$$
+
+关键点：**模型必须对时间 $t$ 敏感**
+
+时间编码函数将标量 $t$ 映射到高维向量：
+$$\text{time\_emb}(t) = [e_1(t), e_2(t), ..., e_d(t)]$$
+
+其中 $e_i$ 是不同频率的基函数（Fourier或Sinusoidal）。
+
+#### 频率多样性的重要性
+
+```
+【不同频率的时间特征】
+
+低频特征 (缓慢变化):
+  ├─ 捕捉全局时间进度
+  ├─ 表示"早期去噪"vs"后期细化"
+  └─ 对应大尺度轨迹特征
+
+中频特征 (中等速度):
+  ├─ 捕捉时间的中层信息
+  ├─ 协调短期动态约束
+  └─ 连接全局和局部
+
+高频特征 (快速变化):
+  ├─ 捕捉精细时间细节
+  ├─ 对应局部轨迹曲率、速度变化
+  └─ 支持高精度时间采样
+
+视觉化：
+  
+时间进度 t
+  0.0    0.25   0.5    0.75   1.0
+  │      │      │      │      │
+  ↓      ↓      ↓      ↓      ↓
+低频:  ─────────────────────────── (一个周期)
+  
+中频:  ───┬───┬───┬───┬───┬───┬─── (3-4个周期)
+  
+高频:  ─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─┬─ (8+ 个周期)
+```
+
+#### Fourier vs Sinusoidal 编码的选择
+
+```
+┌──────────────────┬───────────────────┬──────────────────┐
+│  指标            │  Fourier编码      │  Sinusoidal编码  │
+├──────────────────┼───────────────────┼──────────────────┤
+│ 频率范围         │ 随机采样          │ 固定对数间距     │
+│ 高频表示力       │ 更强（scale=30）  │ 中等              │
+│ 参数数量         │ 少（W向量）       │ 多（MLP）        │
+│ 计算效率         │ 高                │ 中等              │
+│ 可学习性         │ 可选              │ 不可学习         │
+│ 适用场景         │ 通用（推荐）      │ 固定离散时间     │
+└──────────────────┴───────────────────┴──────────────────┘
+```
+
+#### 时间编码调试技巧
+
+```python
+# 1. 检查时间编码的覆盖范围
+from cfm_flowmp.models.embeddings import GaussianFourierProjection
+
+encoder = GaussianFourierProjection(embed_dim=256, scale=30.0)
+
+# 采样整个[0, 1]范围
+t_samples = torch.linspace(0, 1, 1000).unsqueeze(-1)
+embeddings = encoder(t_samples)  # [1000, 256]
+
+# 检查各特征的范围
+print("特征最小值:", embeddings.min(dim=0).values[:10])  # 前10个特征
+print("特征最大值:", embeddings.max(dim=0).values[:10])
+print("特征均值:", embeddings.mean(dim=0)[:10])
+print("特征标准差:", embeddings.std(dim=0)[:10])
+
+# 预期：大多数特征应在 [-1, 1] 范围内（sin/cos输出）
+
+# 2. 检查时间敏感性
+t1 = torch.tensor([[0.5]])
+t2 = torch.tensor([[0.50001]])
+
+emb1 = encoder(t1)
+emb2 = encoder(t2)
+
+distance = (emb1 - emb2).norm()
+print(f"时间差 1e-5 对应的特征差: {distance:.6f}")
+
+# 预期：应该很小，但不为零（连续但可区分）
+
+# 3. 可视化频率响应
+import matplotlib.pyplot as plt
+
+t_range = torch.linspace(0, 1, 1000).unsqueeze(-1)
+embeddings = encoder(t_range)
+
+plt.figure(figsize=(14, 8))
+
+# 绘制前12个特征
+for i in range(12):
+    plt.subplot(3, 4, i+1)
+    plt.plot(t_range.numpy(), embeddings[:, i].numpy())
+    plt.title(f'Feature {i}')
+    plt.xlabel('Time t')
+    plt.ylabel('Value')
+    plt.grid(True)
+
+plt.tight_layout()
+plt.show()
+
+# 预期：观察多频率的周期性变化
+```
+
+#### 时间编码与条件融合的最佳实践
+
+```python
+# ❌ 不好的做法1：时间信息丢失
+def bad_condition_fusion(time_emb, spatial_cond):
+    # 直接忽略时间
+    return spatial_cond  # 时间信息丢失！
+
+# ❌ 不好的做法2：时间信息被淹没
+def bad_condition_fusion(time_emb, spatial_cond):
+    # 简单拼接，但spatial_cond维度过大
+    return torch.cat([time_emb, spatial_cond], dim=-1)
+    # 问题：spatial_cond可能完全压制time_emb的影响
+
+# ✅ 好的做法：分离且平衡的融合
+def good_condition_fusion(time_emb, x_curr, x_goal, e_map, w_style):
+    B = time_emb.shape[0]
+    
+    # 1. 分别编码各条件分量
+    state_enc = MLP([time_emb.shape[1], 128, 128])(time_emb)  # [B, 128]
+    goal_enc = MLP([x_goal.shape[1], 128, 128])(x_goal)       # [B, 128]
+    map_enc = e_map  # 已是[B, 256]
+    style_enc = MLP([w_style.shape[1], 64])(w_style)          # [B, 64]
+    
+    # 2. 拼接（维度相对均衡）
+    combined = torch.cat([
+        time_emb,      # [B, 256] - 时间信息核心
+        state_enc,     # [B, 128]
+        goal_enc,      # [B, 128]
+        map_enc,       # [B, 256]
+        style_enc,     # [B, 64]
+    ], dim=-1)  # [B, 832]
+    
+    # 3. 最终投影到统一维度
+    cond = MLP([832, 512, 256])(combined)  # [B, 256]
+    
+    return cond
+
+# ✅ 更高级：使用注意力加权
+class AttentiveConditionFusion(nn.Module):
+    def forward(self, time_emb, x_curr, x_goal, e_map, w_style):
+        # 各条件的重要性权重（可学习）
+        weights = self.compute_attention_weights({
+            'time': time_emb,
+            'state': self.state_proj(x_curr),
+            'goal': self.goal_proj(x_goal),
+            'map': e_map,
+            'style': self.style_proj(w_style),
+        })
+        
+        # 加权融合
+        weighted_cond = sum(
+            w * cond for w, cond in zip(weights.values(), [time_emb, ...])
+        )
+        
+        return weighted_cond
+```
+
+#### 时间编码的参数敏感性
+
+```
+【Fourier编码参数对性能的影响】
+
+embed_dim (基础维度):
+  ├─ 小 (32): 快速但表达力有限
+  ├─ 中 (256): 平衡性能和表达力（推荐）
+  └─ 大 (512): 强表达力但计算成本高
+
+scale (频率标准差):
+  ├─ 小 (5.0): 频率集中，覆盖范围窄
+  ├─ 中 (30.0): 良好的频率分布（推荐）
+  └─ 大 (100.0): 频率分散，可能过度平滑
+
+【超参数建议】
+
+对于L2层（256维隐空间）:
+  ├─ embed_dim = 256
+  ├─ scale = 30.0
+  ├─ time_embed_dim = 256 (输出维度)
+  └─ 这样time_emb与spatial_cond维度一致
+
+对于不同规模的模型:
+  ├─ 小模型 (hidden_dim=128):
+  │   └─ embed_dim=128, scale=20.0, time_embed_dim=128
+  │
+  ├─ 基础模型 (hidden_dim=256):
+  │   └─ embed_dim=256, scale=30.0, time_embed_dim=256 (推荐)
+  │
+  └─ 大模型 (hidden_dim=512):
+      └─ embed_dim=512, scale=40.0, time_embed_dim=512
+```
+
+---
+
    - 基础理论框架
 
 2. **Diffusion Models**: "Denoising Diffusion Probabilistic Models" (2020)
