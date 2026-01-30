@@ -1,0 +1,29 @@
+# CFM FlowMP Training Framework Dependencies
+# Core Deep Learning
+torch>=2.0.0
+numpy>=1.24.0
+
+# Tensor Operations
+einops>=0.7.0
+
+# ODE Solvers (optional, we provide custom RK4)
+torchdiffeq>=0.2.3
+
+# Visualization & Logging
+matplotlib>=3.7.0
+tensorboard>=2.14.0
+wandb>=0.15.0
+
+# Data Processing
+scipy>=1.11.0
+h5py>=3.9.0
+
+# Progress Bars
+tqdm>=4.65.0
+
+# Configuration
+omegaconf>=2.3.0
+hydra-core>=1.3.0
+
+# B-spline Smoothing
+geomdl>=5.3.1
