@@ -1,0 +1,31 @@
+[project]
+name = "cfm-flowmp"
+version = "0.1.0"
+description = "Conditional Flow Matching training/inference framework (FlowMP-style) for trajectory generation."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Cloud Agent" }]
+
+dependencies = [
+  "numpy",
+  "pyyaml",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+torch = [
+  "torch",
+]
+
+[project.scripts]
+cfm-train = "cfm.training.train:main"
+cfm-sample = "cfm.inference.sample:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["cfm"]
+

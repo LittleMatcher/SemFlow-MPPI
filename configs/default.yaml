@@ -1,0 +1,36 @@
+seed: 42
+
+model:
+  d_model: 256
+  n_heads: 8
+  n_layers: 6
+  d_ff: 1024
+  dropout: 0.0
+  time_embed_dim: 256
+  cond_dim: 6           # [q_start(2), dq_start(2), q_goal(2)]
+  in_dim: 6             # [q(2), dq(2), ddq(2)] concat on channel
+  out_dim: 6            # [u(2), v(2), w(2)]
+
+train:
+  epochs: 10
+  batch_size: 64
+  lr: 1.0e-4
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+  log_every: 50
+  save_every: 500
+  lambda_acc: 1.0
+  lambda_jerk: 1.0
+  num_workers: 2
+  device: auto
+
+data:
+  seq_len: null         # null means use T from file
+
+run:
+  out_dir: runs/exp
+
+inference:
+  steps: 20
+  solver: rk4
+
