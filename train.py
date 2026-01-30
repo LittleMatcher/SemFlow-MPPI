@@ -24,7 +24,12 @@ from torch.utils.data import DataLoader, random_split
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from cfm_flowmp.models import FlowMPTransformer, create_flowmp_transformer
+from cfm_flowmp.models import (
+    FlowMPTransformer,
+    FlowMPUNet1D,
+    create_flowmp_transformer,
+    create_flowmp_unet1d,
+)
 from cfm_flowmp.training import CFMTrainer, FlowMatchingConfig, TrainerConfig
 from cfm_flowmp.data import TrajectoryDataset, SyntheticTrajectoryDataset, create_dataloader
 
@@ -44,15 +49,24 @@ def parse_args():
                        help="Type of synthetic trajectories")
     
     # Model arguments
+    parser.add_argument("--model_type", type=str, default="transformer",
+                       choices=["transformer", "unet1d"],
+                       help="Model type for comparison")
     parser.add_argument("--model_variant", type=str, default="base",
                        choices=["small", "base", "large"],
-                       help="Model size variant")
+                       help="Transformer size variant")
     parser.add_argument("--hidden_dim", type=int, default=256,
-                       help="Transformer hidden dimension")
+                       help="Transformer hidden dimension / time embedding dim")
     parser.add_argument("--num_layers", type=int, default=6,
                        help="Number of transformer layers")
     parser.add_argument("--num_heads", type=int, default=8,
                        help="Number of attention heads")
+    parser.add_argument("--unet_base_channels", type=int, default=128,
+                       help="U-Net base channels")
+    parser.add_argument("--unet_channel_mults", type=str, default="1,2,4,8",
+                       help="U-Net channel multipliers, comma-separated")
+    parser.add_argument("--unet_num_res_blocks", type=int, default=1,
+                       help="U-Net residual blocks per stage")
     parser.add_argument("--seq_len", type=int, default=64,
                        help="Trajectory sequence length")
     parser.add_argument("--state_dim", type=int, default=2,
@@ -185,19 +199,36 @@ def main():
     # ============ Model Setup ============
     print("\n[2/4] Setting up model...")
     
-    model = create_flowmp_transformer(
-        variant=args.model_variant,
-        state_dim=args.state_dim,
-        max_seq_len=args.seq_len,
-        hidden_dim=args.hidden_dim,
-        num_layers=args.num_layers,
-        num_heads=args.num_heads,
-    )
+    if args.model_type == "transformer":
+        model = create_flowmp_transformer(
+            variant=args.model_variant,
+            state_dim=args.state_dim,
+            max_seq_len=args.seq_len,
+            hidden_dim=args.hidden_dim,
+            num_layers=args.num_layers,
+            num_heads=args.num_heads,
+        )
+        model_name = f"transformer-{args.model_variant}"
+    else:
+        channel_mults = tuple(int(x) for x in args.unet_channel_mults.split(",") if x.strip())
+        model = create_flowmp_unet1d(
+            state_dim=args.state_dim,
+            max_seq_len=args.seq_len,
+            time_embed_dim=args.hidden_dim,
+            base_channels=args.unet_base_channels,
+            channel_mults=channel_mults,
+            num_res_blocks=args.unet_num_res_blocks,
+        )
+        model_name = "unet1d"
     
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model variant: {args.model_variant}")
+    print(f"  Model type: {model_name}")
     print(f"  Parameters: {num_params:,}")
-    print(f"  Hidden dim: {args.hidden_dim}")
+    if args.model_type == "transformer":
+        print(f"  Hidden dim: {args.hidden_dim}")
+    else:
+        print(f"  Base channels: {args.unet_base_channels}")
+        print(f"  Channel mults: {args.unet_channel_mults}")
     print(f"  Layers: {args.num_layers}")
     print(f"  Heads: {args.num_heads}")
     
