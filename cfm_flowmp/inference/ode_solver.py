@@ -22,7 +22,7 @@ from dataclasses import dataclass
 class SolverConfig:
     """Configuration for ODE solvers."""
     
-    # Number of integration steps
+    # Number of integration steps (for uniform stepping)
     num_steps: int = 20
     
     # Time range
@@ -36,6 +36,19 @@ class SolverConfig:
     
     # Whether to return intermediate states
     return_trajectory: bool = False
+    
+    # Custom time schedule (overrides num_steps if provided)
+    # Following "Unified Generation-Refinement Planning" approach
+    time_schedule: Optional[List[float]] = None
+    
+    # Predefined schedules
+    use_8step_schedule: bool = False  # Use aggressive 8-step schedule
+
+
+# Predefined time schedules based on "Unified Generation-Refinement Planning"
+SCHEDULE_8STEP = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+SCHEDULE_UNIFORM_10 = [i/10 for i in range(11)]
+SCHEDULE_UNIFORM_20 = [i/20 for i in range(21)]
 
 
 class EulerSolver:
@@ -43,6 +56,7 @@ class EulerSolver:
     Euler method (first-order) ODE solver.
     
     Simple but less accurate. Useful for debugging and fast inference.
+    Supports custom time schedules for non-uniform stepping.
     
     Update rule:
         x_{n+1} = x_n + dt * v(x_n, t_n)
@@ -51,11 +65,23 @@ class EulerSolver:
     def __init__(self, config: SolverConfig = None):
         self.config = config or SolverConfig()
     
+    def _get_time_schedule(self, num_steps: int = None) -> List[float]:
+        """Get the time schedule for ODE integration."""
+        if self.config.time_schedule is not None:
+            return self.config.time_schedule
+        elif self.config.use_8step_schedule:
+            return SCHEDULE_8STEP
+        else:
+            n = num_steps or self.config.num_steps
+            return [self.config.t_start + i * (self.config.t_end - self.config.t_start) / n 
+                    for i in range(n + 1)]
+    
     def solve(
         self,
         velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         x_0: torch.Tensor,
         num_steps: int = None,
+        time_schedule: List[float] = None,
     ) -> torch.Tensor:
         """
         Solve ODE using Euler method.
@@ -64,25 +90,33 @@ class EulerSolver:
             velocity_fn: Function v(x, t) returning velocity at state x and time t
             x_0: Initial state [B, T, D]
             num_steps: Number of integration steps (overrides config)
+            time_schedule: Custom time schedule (overrides config)
             
         Returns:
             Final state x_1 at t=1
         """
-        num_steps = num_steps or self.config.num_steps
-        dt = (self.config.t_end - self.config.t_start) / num_steps
+        # Get time schedule
+        if time_schedule is not None:
+            schedule = time_schedule
+        else:
+            schedule = self._get_time_schedule(num_steps)
         
         x = x_0.clone()
-        t = torch.full((x_0.shape[0],), self.config.t_start, device=x_0.device, dtype=x_0.dtype)
+        B = x_0.shape[0]
         
         trajectory = [x.clone()] if self.config.return_trajectory else None
         
-        for step in range(num_steps):
-            # Compute velocity
-            v = velocity_fn(x, t)
+        # Integrate through the time schedule
+        for i in range(len(schedule) - 1):
+            t_curr = schedule[i]
+            t_next = schedule[i + 1]
+            dt = t_next - t_curr
             
-            # Euler update
+            t = torch.full((B,), t_curr, device=x_0.device, dtype=x_0.dtype)
+            
+            # Compute velocity and update
+            v = velocity_fn(x, t)
             x = x + dt * v
-            t = t + dt
             
             if trajectory is not None:
                 trajectory.append(x.clone())
@@ -100,6 +134,9 @@ class RK4Solver:
     Provides good balance between accuracy and computational cost.
     This is the recommended solver for FlowMP inference.
     
+    Supports both uniform stepping and custom time schedules as described
+    in "Unified Generation-Refinement Planning" (e.g., 8-step schedule).
+    
     Update rule (RK4):
         k1 = v(x_n, t_n)
         k2 = v(x_n + dt/2 * k1, t_n + dt/2)
@@ -111,11 +148,24 @@ class RK4Solver:
     def __init__(self, config: SolverConfig = None):
         self.config = config or SolverConfig()
     
+    def _get_time_schedule(self, num_steps: int = None) -> List[float]:
+        """Get the time schedule for ODE integration."""
+        # Priority: custom schedule > 8-step flag > uniform stepping
+        if self.config.time_schedule is not None:
+            return self.config.time_schedule
+        elif self.config.use_8step_schedule:
+            return SCHEDULE_8STEP
+        else:
+            n = num_steps or self.config.num_steps
+            return [self.config.t_start + i * (self.config.t_end - self.config.t_start) / n 
+                    for i in range(n + 1)]
+    
     def solve(
         self,
         velocity_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         x_0: torch.Tensor,
         num_steps: int = None,
+        time_schedule: List[float] = None,
     ) -> torch.Tensor:
         """
         Solve ODE using RK4 method.
@@ -123,21 +173,32 @@ class RK4Solver:
         Args:
             velocity_fn: Function v(x, t) returning velocity at state x and time t
             x_0: Initial state [B, T, D] or [B, D]
-            num_steps: Number of integration steps (overrides config)
+            num_steps: Number of integration steps (overrides config, ignored if time_schedule provided)
+            time_schedule: Custom time schedule (overrides config)
             
         Returns:
             Final state x_1 at t=1, or trajectory if return_trajectory=True
         """
-        num_steps = num_steps or self.config.num_steps
-        dt = (self.config.t_end - self.config.t_start) / num_steps
+        # Get time schedule
+        if time_schedule is not None:
+            schedule = time_schedule
+        else:
+            schedule = self._get_time_schedule(num_steps)
         
         x = x_0.clone()
         B = x_0.shape[0]
-        t = torch.full((B,), self.config.t_start, device=x_0.device, dtype=x_0.dtype)
         
         trajectory = [x.clone()] if self.config.return_trajectory else None
         
-        for step in range(num_steps):
+        # Integrate through the time schedule
+        for i in range(len(schedule) - 1):
+            t_curr = schedule[i]
+            t_next = schedule[i + 1]
+            dt = t_next - t_curr
+            
+            # Current time as tensor
+            t = torch.full((B,), t_curr, device=x_0.device, dtype=x_0.dtype)
+            
             # RK4 stages
             k1 = velocity_fn(x, t)
             k2 = velocity_fn(x + 0.5 * dt * k1, t + 0.5 * dt)
@@ -146,7 +207,6 @@ class RK4Solver:
             
             # Update state
             x = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-            t = t + dt
             
             if trajectory is not None:
                 trajectory.append(x.clone())
