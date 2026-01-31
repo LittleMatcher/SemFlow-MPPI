@@ -5,11 +5,12 @@ Tests all three condition types and ensures no errors occur.
 """
 
 import sys
+from pathlib import Path
 import torch
 import torch.nn as nn
 
 # Add parent directory to path
-sys.path.insert(0, '/home/runner/work/SemFlow-MPPI/SemFlow-MPPI')
+sys.path.insert(0, str(Path(__file__).parent))
 
 def test_transformer_import():
     """Test that we can import the transformer module."""

@@ -167,11 +167,11 @@ class CrossAttention(nn.Module):
         N = cond_tokens.shape[1]
         
         # Project queries from trajectory
-        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).contiguous().transpose(1, 2)
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         
         # Project keys and values from condition
         kv = self.kv_proj(cond_tokens).reshape(B, N, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, :, 0].contiguous().transpose(1, 2), kv[:, :, 1].contiguous().transpose(1, 2)
+        k, v = kv[:, :, 0].transpose(1, 2).contiguous(), kv[:, :, 1].transpose(1, 2).contiguous()
         
         # Cross-attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
