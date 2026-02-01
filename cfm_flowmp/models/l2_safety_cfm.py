@@ -133,7 +133,7 @@ class L2SafetyCFM(nn.Module):
                 num_layers=config.num_layers,
                 num_heads=config.num_heads,
                 time_embed_dim=time_embed_dim,
-                env_encoding_dim=0,  # We handle conditioning separately
+                env_encoding_dim=config.cost_map_latent_dim,  # Fixed: pass correct env encoding dimension
             )
         else:
             from .unet_1d import create_flowmp_unet1d
