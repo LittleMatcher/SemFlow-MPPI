@@ -47,6 +47,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.dropout = dropout  # Store dropout rate for flash attention
         
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         
@@ -83,7 +84,7 @@ class MultiHeadSelfAttention(nn.Module):
             attn_out = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
-                dropout_p=self.proj_drop.p if self.training else 0.0,
+                dropout_p=self.dropout if self.training else 0.0,
             )
         else:
             # Manual attention computation
@@ -97,7 +98,7 @@ class MultiHeadSelfAttention(nn.Module):
             attn_out = attn @ v  # [B, num_heads, T, head_dim]
         
         # Reshape and project
-        attn_out = attn_out.transpose(1, 2).reshape(B, T, C)
+        attn_out = attn_out.transpose(1, 2).contiguous().reshape(B, T, C)
         out = self.proj(attn_out)
         
         return out
@@ -166,18 +167,18 @@ class CrossAttention(nn.Module):
         N = cond_tokens.shape[1]
         
         # Project queries from trajectory
-        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
         
         # Project keys and values from condition
         kv = self.kv_proj(cond_tokens).reshape(B, N, 2, self.num_heads, self.head_dim)
-        k, v = kv[:, :, 0].transpose(1, 2), kv[:, :, 1].transpose(1, 2)
+        k, v = kv[:, :, 0].transpose(1, 2).contiguous(), kv[:, :, 1].transpose(1, 2).contiguous()
         
         # Cross-attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn, dim=-1)
         attn = self.dropout(attn)
         
-        out = (attn @ v).transpose(1, 2).reshape(B, T, D)
+        out = (attn @ v).transpose(1, 2).contiguous().reshape(B, T, D)
         return self.out_proj(out)
 
 
@@ -464,6 +465,13 @@ class FlowMPTransformer(nn.Module):
             # Start token + Goal token = 2 condition tokens
             self.cond_token_proj = nn.Linear(time_embed_dim, hidden_dim)
             self.num_cond_tokens = 2
+            
+            # Still need cond_combine for AdaLN normalization
+            self.cond_combine = nn.Sequential(
+                nn.Linear(time_embed_dim * 2, cond_dim),
+                nn.GELU(),
+                nn.Linear(cond_dim, cond_dim),
+            )
         else:
             # AdaLN or Cross-Attention: combine time and condition
             self.cond_combine = nn.Sequential(
@@ -471,6 +479,10 @@ class FlowMPTransformer(nn.Module):
                 nn.GELU(),
                 nn.Linear(cond_dim, cond_dim),
             )
+            
+            # For adaln mode: project time embedding to hidden_dim for token addition
+            if condition_type == "adaln":
+                self.time_proj = nn.Linear(time_embed_dim, hidden_dim)
         
         # For cross-attention: project condition to tokens
         if use_cross_attention:
@@ -614,7 +626,8 @@ class FlowMPTransformer(nn.Module):
         else:  # "adaln" (default)
             # Time embedding added to token embedding as per spec
             # Then combined with condition for AdaLN modulation
-            h = h + time_emb.unsqueeze(1)  # Add time embedding to all tokens
+            time_emb_proj = self.time_proj(time_emb)  # Project to hidden_dim
+            h = h + time_emb_proj.unsqueeze(1)  # Add time embedding to all tokens
             
             combined_cond = self.cond_combine(
                 torch.cat([time_emb, cond_emb], dim=-1)
