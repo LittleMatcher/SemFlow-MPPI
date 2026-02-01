@@ -46,6 +46,14 @@ class GeneratorConfig:
     
     # Sampling
     num_samples: int = 1  # Number of trajectories to generate per condition
+    
+    # ============ Warm-Start (On-Policy) Settings ============
+    # Implements "short-term memory" policy continuation similar to On-Policy RL
+    # The optimal trajectory from time t becomes a strong prior at time t+1
+    enable_warm_start: bool = False  # Enable temporal warm-start mechanism
+    warm_start_noise_scale: float = 0.1  # Noise scale for warm-started initial state
+    warm_start_shift_mode: str = "zero_pad"  # 'zero_pad', 'repeat_last', 'predict'
+    warm_start_memory_length: int = 1  # Number of previous trajectories to remember
 
 
 # 8-step schedule from "Unified Generation-Refinement Planning"
@@ -230,6 +238,13 @@ class TrajectoryGenerator:
     2. Solving the ODE dx/dt = v_θ(x, t, c) from t=0 to t=1
     3. Optionally smoothing with B-splines for physical consistency
     
+    **Warm-Start (On-Policy) Feature:**
+    When enabled, implements temporal continuity similar to On-Policy RL:
+    - At time t, MPPI outputs optimal control sequence u*_t
+    - At time t+1, u*_t is shifted forward to create prior ũ_t+1
+    - CFM starts from noised version of ũ_t+1 instead of pure Gaussian noise
+    - This creates "policy continuation" where decisions build on previous steps
+    
     Usage:
         generator = TrajectoryGenerator(model, config)
         trajectories = generator.generate(
@@ -280,6 +295,139 @@ class TrajectoryGenerator:
             )
         else:
             self.smoother = None
+        
+        # ============ Warm-Start Memory ============
+        # Stores the most recent optimal trajectory for temporal warm-start
+        # This implements "short-term memory" similar to On-Policy RL
+        self.warm_start_cache: Optional[Dict[str, torch.Tensor]] = None
+        self.warm_start_timestep: int = 0
+    
+    def _shift_trajectory_forward(
+        self, 
+        trajectory: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Shift trajectory forward in time by one step (temporal shift operation).
+        
+        Implements the "shift operation" from On-Policy RL warm-start:
+        - Discard the first control/state (already executed)
+        - Shift remaining sequence forward
+        - Pad the end according to shift_mode
+        
+        Args:
+            trajectory: Control/state sequence [B, T, D]
+            
+        Returns:
+            Shifted trajectory [B, T, D]
+        """
+        B, T, D = trajectory.shape
+        device = trajectory.device
+        dtype = trajectory.dtype
+        
+        # Shift: remove first timestep, append new last timestep
+        shifted = trajectory[:, 1:, :]  # [B, T-1, D]
+        
+        # Pad the end based on shift_mode
+        if self.config.warm_start_shift_mode == "zero_pad":
+            # Append zeros (deceleration/stopping)
+            padding = torch.zeros(B, 1, D, device=device, dtype=dtype)
+        elif self.config.warm_start_shift_mode == "repeat_last":
+            # Repeat last state (constant velocity/control)
+            padding = trajectory[:, -1:, :]
+        elif self.config.warm_start_shift_mode == "predict":
+            # Linear extrapolation from last two steps
+            if T >= 2:
+                last_two = trajectory[:, -2:, :]
+                delta = last_two[:, 1:] - last_two[:, 0:1]
+                padding = last_two[:, 1:] + delta
+            else:
+                padding = trajectory[:, -1:, :]
+        else:
+            raise ValueError(f"Unknown shift_mode: {self.config.warm_start_shift_mode}")
+        
+        shifted_traj = torch.cat([shifted, padding], dim=1)  # [B, T, D]
+        return shifted_traj
+    
+    def _create_warm_start_prior(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Create warm-started initial state from cached trajectory.
+        
+        Implements the "noised prior" from On-Policy RL:
+        - Take cached optimal trajectory from t-1
+        - Shift it forward in time
+        - Add controlled noise to maintain exploration
+        
+        Args:
+            batch_size: Batch size
+            device: Device
+            dtype: Data type
+            
+        Returns:
+            Warm-started initial state x_0 [B, T, D*3]
+        """
+        if self.warm_start_cache is None:
+            # No cache, return pure Gaussian noise
+            return torch.randn(
+                batch_size, 
+                self.config.seq_len, 
+                self.config.state_dim * 3,
+                device=device, 
+                dtype=dtype
+            )
+        
+        # Shift cached trajectory forward
+        cached_state = self.warm_start_cache['raw_output']  # [B_cache, T, D*3]
+        
+        # Handle batch size mismatch (repeat if needed)
+        B_cache = cached_state.shape[0]
+        if B_cache < batch_size:
+            repeat_factor = (batch_size + B_cache - 1) // B_cache
+            cached_state = cached_state.repeat(repeat_factor, 1, 1)[:batch_size]
+        elif B_cache > batch_size:
+            cached_state = cached_state[:batch_size]
+        
+        # Shift forward in time
+        shifted_prior = self._shift_trajectory_forward(cached_state)
+        
+        # Add exploration noise (scaled Gaussian)
+        noise = torch.randn_like(shifted_prior) * self.config.warm_start_noise_scale
+        warm_start_x0 = shifted_prior + noise
+        
+        return warm_start_x0
+    
+    def update_warm_start_cache(
+        self,
+        optimal_trajectory: Dict[str, torch.Tensor],
+    ):
+        """
+        Update warm-start cache with latest optimal trajectory.
+        
+        This should be called after MPPI optimization produces u*_t.
+        In a full implementation, this would be called by the L1 MPPI layer.
+        
+        Args:
+            optimal_trajectory: Dictionary containing the optimal trajectory
+                - Must include 'raw_output' key with full state [B, T, D*3]
+        """
+        self.warm_start_cache = {
+            'raw_output': optimal_trajectory['raw_output'].detach().clone(),
+            'timestep': self.warm_start_timestep,
+        }
+        self.warm_start_timestep += 1
+    
+    def reset_warm_start(self):
+        """
+        Reset warm-start cache.
+        
+        Call this when starting a new episode or when trajectory continuity breaks.
+        """
+        self.warm_start_cache = None
+        self.warm_start_timestep = 0
     
     def _create_velocity_fn(
         self,
@@ -359,9 +507,16 @@ class TrajectoryGenerator:
                 start_vel = start_vel.repeat(num_samples, 1)
             B = B * num_samples
         
-        # Sample initial noise x_0 ~ N(0, I)
-        # State has 6 channels: pos(2) + vel(2) + acc(2)
-        x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
+        # ============ Warm-Start Initial State ============
+        # Sample initial noise x_0
+        # If warm-start is enabled and cache exists, use shifted prior + noise
+        # Otherwise, sample from pure Gaussian N(0, I)
+        if self.config.enable_warm_start:
+            x_0 = self._create_warm_start_prior(B, device, dtype)
+        else:
+            # Standard CFM: sample from N(0, I)
+            # State has 6 channels: pos(2) + vel(2) + acc(2)
+            x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
         
         # Create velocity function
         velocity_fn = self._create_velocity_fn(start_pos, goal_pos, start_vel)
@@ -387,11 +542,11 @@ class TrajectoryGenerator:
             result['velocities'] = velocities_raw
             result['accelerations'] = accelerations_raw
         
-        if return_raw:
-            result['raw_positions'] = positions_raw
-            result['raw_velocities'] = velocities_raw
-            result['raw_accelerations'] = accelerations_raw
-            result['raw_output'] = x_1
+        # Always store raw output for potential warm-start
+        result['raw_positions'] = positions_raw
+        result['raw_velocities'] = velocities_raw
+        result['raw_accelerations'] = accelerations_raw
+        result['raw_output'] = x_1
         
         return result
     
