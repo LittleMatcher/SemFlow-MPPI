@@ -278,9 +278,8 @@ class TrajectoryGenerator:
         # Create ODE solver with time schedule
         solver_config = SolverConfig(
             num_steps=self.config.num_steps,
-            time_schedule=self.config.time_schedule,
+            time_schedule=time_schedule,  # Use computed time_schedule
             return_trajectory=False,
-            time_schedule=time_schedule,
             use_8step_schedule=self.config.use_8step_schedule,
         )
         self.solver = create_solver(self.config.solver_type, solver_config)
@@ -471,6 +470,7 @@ class TrajectoryGenerator:
         start_vel: Optional[torch.Tensor] = None,
         num_samples: int = None,
         return_raw: bool = False,
+        warm_start_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Generate trajectories for given conditions.
@@ -479,19 +479,34 @@ class TrajectoryGenerator:
             start_pos: Starting positions [B, D]
             goal_pos: Goal positions [B, D]
             start_vel: Starting velocities [B, D] (optional)
-            num_samples: Number of samples per condition
-            return_raw: Whether to also return raw (unsmoothed) trajectory
+            num_samples: Number of samples per condition. 
+                        When > 1, generates multiple trajectories per condition.
+                        Output batch size becomes B * num_samples.
+            return_raw: Whether to include raw (unsmoothed) trajectory outputs in the
+                       returned dictionary. If False, only smoothed trajectories are returned.
+                       Note: Raw outputs are always computed internally for warm-start purposes,
+                       but are only included in the return dict when return_raw=True.
             
         Returns:
             Dictionary containing:
-                - 'positions': Generated position trajectories [B, T, D]
-                - 'velocities': Generated velocity trajectories [B, T, D]
-                - 'accelerations': Generated acceleration trajectories [B, T, D]
-                - 'raw_output': Raw model output before smoothing (if return_raw=True)
+                - 'positions': Generated position trajectories [B*num_samples, T, D]
+                  When num_samples=1: [B, T, D]
+                  When num_samples>1: [B*num_samples, T, D] (K anchor trajectories for L1)
+                - 'velocities': Generated velocity trajectories [B*num_samples, T, D]
+                - 'accelerations': Generated acceleration trajectories [B*num_samples, T, D]
+                - 'raw_output': Raw model output [B*num_samples, T, D*3] (only if return_raw=True)
+                - 'raw_positions': Raw positions before smoothing [B*num_samples, T, D] (only if return_raw=True)
+                - 'raw_velocities': Raw velocities before smoothing [B*num_samples, T, D] (only if return_raw=True)
+                - 'raw_accelerations': Raw accelerations before smoothing [B*num_samples, T, D] (only if return_raw=True)
+                
+        Note:
+            This method is designed to work with L1 MPPI layer:
+            - When num_samples > 1, the output contains K = B*num_samples anchor trajectories
+            - L1 layer can directly use these as anchors: initialize_from_l2_output(l2_output)
         """
         self.model.eval()
         
-        B = start_pos.shape[0]
+        B_original = start_pos.shape[0]  # Original batch size (before num_samples expansion)
         D = self.config.state_dim
         T = self.config.seq_len
         device = start_pos.device
@@ -505,13 +520,54 @@ class TrajectoryGenerator:
             goal_pos = goal_pos.repeat(num_samples, 1)
             if start_vel is not None:
                 start_vel = start_vel.repeat(num_samples, 1)
-            B = B * num_samples
+            B = B_original * num_samples  # Expanded batch size
+        else:
+            B = B_original  # No expansion needed
         
         # ============ Warm-Start Initial State ============
-        # Sample initial noise x_0
-        # If warm-start is enabled and cache exists, use shifted prior + noise
-        # Otherwise, sample from pure Gaussian N(0, I)
-        if self.config.enable_warm_start:
+        # Sample or initialize initial state x_0.
+        # Priority:
+        #   1) Explicit warm_start_state (from L1 / external controller)
+        #   2) Internal warm-start cache (GeneratorConfig.enable_warm_start)
+        #   3) Standard CFM: pure Gaussian noise N(0, I)
+        if warm_start_state is not None:
+            # Accept shapes:
+            #   [T, D*3] -> broadcast to [B, T, D*3]
+            #   [1, T, D*3] -> broadcast to [B, T, D*3]
+            #   [B_original, T, D*3] -> repeat to [B_original*num_samples, T, D*3] if num_samples>1
+            #   [B, T, D*3] -> use as is (already matches expanded batch size)
+            ws = warm_start_state
+            if ws.dim() == 2:
+                ws = ws.unsqueeze(0)
+            if ws.shape[-1] != D * 3 or ws.shape[-2] != T:
+                raise ValueError(
+                    f"warm_start_state must have shape [*, {T}, {D*3}], "
+                    f"got {tuple(ws.shape)}"
+                )
+            ws = ws.to(device=device, dtype=dtype)
+            
+            # Handle different input shapes
+            ws_batch_size = ws.shape[0]
+            
+            # Case 1: Single trajectory [1, T, D*3] -> broadcast to full batch
+            if ws_batch_size == 1 and B > 1:
+                ws = ws.repeat(B, 1, 1)
+            # Case 2: Per-condition warm-start [B_original, T, D*3] -> expand for num_samples
+            elif ws_batch_size == B_original and num_samples > 1:
+                ws = ws.repeat_interleave(num_samples, dim=0)
+            # Case 3: Already matches expanded batch size [B, T, D*3] -> use as is
+            elif ws_batch_size == B:
+                pass  # Already correct shape
+            # Case 4: Invalid shape
+            else:
+                raise ValueError(
+                    f"Incompatible warm_start_state batch size {ws_batch_size}. "
+                    f"Expected one of: 1, {B_original} (per-condition), or {B} (full batch). "
+                    f"Got shape {tuple(ws.shape)} for B_original={B_original}, num_samples={num_samples}, B={B}"
+                )
+            x_0 = ws
+        elif self.config.enable_warm_start:
+            # Use internal warm-start cache: shifted prior + noise
             x_0 = self._create_warm_start_prior(B, device, dtype)
         else:
             # Standard CFM: sample from N(0, I)
@@ -542,11 +598,16 @@ class TrajectoryGenerator:
             result['velocities'] = velocities_raw
             result['accelerations'] = accelerations_raw
         
-        # Always store raw output for potential warm-start
-        result['raw_positions'] = positions_raw
-        result['raw_velocities'] = velocities_raw
-        result['raw_accelerations'] = accelerations_raw
-        result['raw_output'] = x_1
+        # Store raw outputs conditionally based on return_raw parameter
+        # Raw outputs are always computed (needed for smoothing), but only included
+        # in return dict if return_raw=True. This allows users to control output size.
+        # Note: For warm-start functionality, users should call update_warm_start_cache()
+        # with the raw_output from a previous generation (when return_raw=True).
+        if return_raw:
+            result['raw_positions'] = positions_raw
+            result['raw_velocities'] = velocities_raw
+            result['raw_accelerations'] = accelerations_raw
+            result['raw_output'] = x_1
         
         return result
     
@@ -573,7 +634,11 @@ class TrajectoryGenerator:
             obstacle_fn: Function that returns gradient for obstacle avoidance
             
         Returns:
-            Generated trajectories
+            Dictionary containing:
+                - 'positions': Generated position trajectories [B, T, D]
+                - 'velocities': Generated velocity trajectories [B, T, D]
+                - 'accelerations': Generated acceleration trajectories [B, T, D]
+                - 'raw_output': Raw model output [B, T, D*3] (for consistency with generate())
         """
         # Note: Full CFG requires model trained with condition dropout
         # This is a simplified version with optional obstacle guidance
@@ -620,15 +685,25 @@ class TrajectoryGenerator:
         # Extract and optionally smooth
         positions_raw = x_1[..., :D]
         
+        result = {}
+        
         if self.smoother is not None:
             smoothed = self.smoother.smooth(positions_raw, return_derivatives=True)
-            return smoothed
+            result['positions'] = smoothed['positions']
+            result['velocities'] = smoothed['velocities']
+            result['accelerations'] = smoothed['accelerations']
+        else:
+            result['positions'] = positions_raw
+            result['velocities'] = x_1[..., D:D*2]
+            result['accelerations'] = x_1[..., D*2:D*3]
         
-        return {
-            'positions': positions_raw,
-            'velocities': x_1[..., D:D*2],
-            'accelerations': x_1[..., D*2:D*3],
-        }
+        # Include raw output for consistency with generate() method
+        result['raw_output'] = x_1
+        result['raw_positions'] = positions_raw
+        result['raw_velocities'] = x_1[..., D:D*2]
+        result['raw_accelerations'] = x_1[..., D*2:D*3]
+        
+        return result
     
     @torch.no_grad()
     def generate_batch(

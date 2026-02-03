@@ -184,6 +184,12 @@ class L2SafetyCFM(nn.Module):
             Condition embedding [B, time_embed_dim]
         """
         B = x_curr.shape[0]
+        device = x_curr.device
+        
+        # Ensure all tensors are on the same device
+        x_curr = x_curr.to(device)
+        x_goal = x_goal.to(device)
+        e_map = e_map.to(device)
         
         # Build condition vector
         cond_parts = [x_curr, x_goal, e_map]
@@ -191,7 +197,10 @@ class L2SafetyCFM(nn.Module):
         if self.config.use_style_conditioning:
             if w_style is None:
                 # Default balanced style
-                w_style = torch.ones(B, self.config.style_dim, device=x_curr.device) / 3.0
+                w_style = torch.ones(B, self.config.style_dim, device=device, dtype=x_curr.dtype) / self.config.style_dim
+            else:
+                # Ensure w_style is on the correct device
+                w_style = w_style.to(device)
             cond_parts.append(w_style)
         
         # Concatenate and project

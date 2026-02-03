@@ -63,6 +63,9 @@ class TrainerConfig:
     use_ema: bool = True
     ema_decay: float = 0.9999
     ema_update_every: int = 10
+    # Note: Validation uses current model weights by default (not EMA)
+    # because EMA weights change too slowly in early training.
+    # Set use_ema=True in validate() call to use EMA weights.
     
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -279,7 +282,13 @@ class CFMTrainer:
         target = interp_result['target']
         
         # Forward pass with mixed precision
-        with torch.cuda.amp.autocast(enabled=self.config.use_amp):
+        # Only use autocast for CUDA devices (CPU doesn't support mixed precision)
+        if self.config.use_amp and 'cuda' in self.config.device:
+            autocast_context = torch.amp.autocast(device_type='cuda', enabled=True)
+        else:
+            autocast_context = torch.amp.autocast(device_type='cpu', enabled=False)
+        
+        with autocast_context:
             model_output = self.model(
                 x_t=x_t,
                 t=t,
@@ -327,9 +336,15 @@ class CFMTrainer:
             self.scheduler.step()
     
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
+    def validate(self, use_ema: bool = None) -> Dict[str, float]:
         """
         Run validation loop.
+        
+        Args:
+            use_ema: Whether to use EMA weights for validation.
+                    If None, defaults to False (uses current model weights).
+                    This is because EMA weights change too slowly in early training.
+                    Set to True to use EMA weights instead.
         
         Returns:
             Dictionary of average validation metrics
@@ -339,8 +354,15 @@ class CFMTrainer:
         
         self.model.eval()
         
-        # Use EMA weights for validation
-        if self.ema is not None:
+        # Determine whether to use EMA weights
+        # Default to False (current weights) as per documentation
+        # EMA weights change too slowly in early training, so current weights
+        # provide better feedback on training progress
+        if use_ema is None:
+            use_ema = False
+        
+        # Use EMA weights for validation (if enabled and requested)
+        if use_ema and self.ema is not None:
             self.ema.apply_shadow()
         
         total_loss = 0
@@ -371,7 +393,13 @@ class CFMTrainer:
                 t=t,
             )
             
-            with torch.cuda.amp.autocast(enabled=self.config.use_amp):
+            # Only use autocast for CUDA devices (CPU doesn't support mixed precision)
+            if self.config.use_amp and 'cuda' in self.config.device:
+                autocast_context = torch.amp.autocast(device_type='cuda', enabled=True)
+            else:
+                autocast_context = torch.amp.autocast(device_type='cpu', enabled=False)
+            
+            with autocast_context:
                 model_output = self.model(
                     x_t=interp_result['x_t'],
                     t=t,
@@ -388,9 +416,12 @@ class CFMTrainer:
             total_loss_jerk += loss_dict['loss_jerk'].item()
             num_batches += 1
         
-        # Restore original weights
-        if self.ema is not None:
+        # Restore original weights (if EMA was used)
+        if use_ema and self.ema is not None:
             self.ema.restore()
+        
+        if num_batches == 0:
+            return {}
         
         return {
             'val_loss': total_loss / num_batches,
@@ -410,6 +441,30 @@ class CFMTrainer:
         if filename is None:
             filename = f"step_{self.global_step}.pt"
         
+        # 提取模型配置信息（用于推理时重建模型）
+        model_config = {}
+        if hasattr(self.model, 'hidden_dim'):
+            model_config['hidden_dim'] = self.model.hidden_dim
+        if hasattr(self.model, 'num_layers') or hasattr(self.model, 'blocks'):
+            model_config['num_layers'] = len(self.model.blocks) if hasattr(self.model, 'blocks') else getattr(self.model, 'num_layers', None)
+        if hasattr(self.model, 'num_heads'):
+            model_config['num_heads'] = self.model.num_heads
+        if hasattr(self.model, 'state_dim'):
+            model_config['state_dim'] = self.model.state_dim
+        if hasattr(self.model, 'max_seq_len'):
+            model_config['max_seq_len'] = self.model.max_seq_len
+        # 重要：保存 time_embed_dim（可能不同于 hidden_dim）
+        if hasattr(self.model, 'time_embed'):
+            # 从 time_embed 推断 time_embed_dim
+            if hasattr(self.model.time_embed, 'embed_dim'):
+                model_config['time_embed_dim'] = self.model.time_embed.embed_dim
+            elif hasattr(self.model.time_embed, 'output_proj'):
+                # 从 output_proj 的形状推断
+                if hasattr(self.model.time_embed.output_proj, 'out_features'):
+                    model_config['time_embed_dim'] = self.model.time_embed.output_proj.out_features
+                elif hasattr(self.model.time_embed.output_proj, 'weight'):
+                    model_config['time_embed_dim'] = self.model.time_embed.output_proj.weight.shape[0]
+        
         checkpoint = {
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -420,6 +475,7 @@ class CFMTrainer:
             'current_epoch': self.current_epoch,
             'best_val_loss': self.best_val_loss,
             'config': self.config,
+            'model_config': model_config,  # 保存模型架构配置
         }
         
         path = Path(self.config.checkpoint_dir) / filename
@@ -436,7 +492,7 @@ class CFMTrainer:
         Args:
             path: Path to checkpoint file
         """
-        checkpoint = torch.load(path, map_location=self.config.device)
+        checkpoint = torch.load(path, map_location=self.config.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -547,7 +603,9 @@ class CFMTrainer:
                     
                     # Validation
                     if self.global_step % self.config.eval_interval == 0:
-                        val_metrics = self.validate()
+                        # Use current model weights (not EMA) for validation to see real progress
+                        # EMA weights change too slowly in early training
+                        val_metrics = self.validate(use_ema=False)
                         
                         if val_metrics:
                             print(f"\nStep {self.global_step} - Val Loss: {val_metrics['val_loss']:.4f}")
@@ -573,9 +631,15 @@ class CFMTrainer:
             print(f"Epoch {epoch + 1} completed - Average Loss: {avg_epoch_loss:.4f}")
             
             # Epoch-level validation
-            val_metrics = self.validate()
+            # Use current model weights (not EMA) to see real validation progress
+            val_metrics = self.validate(use_ema=False)
             if val_metrics:
                 print(f"Validation Loss: {val_metrics['val_loss']:.4f}")
+                # Also log EMA validation for comparison (optional)
+                if self.ema is not None:
+                    val_metrics_ema = self.validate(use_ema=True)
+                    if val_metrics_ema:
+                        print(f"Validation Loss (EMA): {val_metrics_ema['val_loss']:.4f}")
         
         # Save final checkpoint
         self.save_checkpoint(filename="final_model.pt")

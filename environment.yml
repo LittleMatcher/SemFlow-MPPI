@@ -1,0 +1,29 @@
+name: semflow-mppi
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - pip
+  - numpy>=1.24.0
+  - scipy>=1.11.0
+  - matplotlib>=3.7.0
+  - h5py>=3.9.0
+  - tqdm>=4.65.0
+  - pip:
+    # Core Deep Learning
+    - torch>=2.0.0
+    # Tensor Operations
+    - einops>=0.7.0
+    # ODE Solvers
+    - torchdiffeq>=0.2.3
+    # Visualization & Logging
+    - tensorboard>=2.14.0
+    - wandb>=0.15.0
+    # Configuration
+    - omegaconf>=2.3.0
+    - hydra-core>=1.3.0
+    # B-spline Smoothing
+    - geomdl>=5.3.1
+

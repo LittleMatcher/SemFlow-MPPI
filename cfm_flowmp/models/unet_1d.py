@@ -278,6 +278,11 @@ class FlowMPUNet1D(nn.Module):
         h = self.mid_block1(h, cond)
         h = self.mid_block2(h, cond)
 
+        # Remove the last skip (deepest layer) as it's not used in upsampling
+        # The upsampling path has len(down_channels) - 1 blocks, so we need to remove one skip
+        if len(skips) > len(self.up_blocks):
+            skips.pop()  # Remove the deepest skip (corresponds to the layer before middle)
+
         for blocks, up in zip(self.up_blocks, self.upsamples):
             skip = skips.pop()
             h = up(h, target_len=skip.shape[-1])

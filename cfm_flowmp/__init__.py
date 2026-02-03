@@ -25,6 +25,12 @@ try:
     from .models import FlowMPTransformer, FlowMPUNet1D
     from .training import CFMTrainer, FlowMatchingLoss
     from .inference import TrajectoryGenerator, RK4Solver
+    # L1 反应控制层（可选）
+    try:
+        from .inference import L1ReactiveController, L1Config
+    except ImportError:
+        L1ReactiveController = None
+        L1Config = None
 except Exception as exc:  # 允许在缺少依赖时继续使用接口系统
     FlowMPTransformer = None
     FlowMPUNet1D = None
@@ -32,6 +38,8 @@ except Exception as exc:  # 允许在缺少依赖时继续使用接口系统
     FlowMatchingLoss = None
     TrajectoryGenerator = None
     RK4Solver = None
+    L1ReactiveController = None
+    L1Config = None
     _core_import_error = exc
 
 # 接口系统
@@ -68,6 +76,8 @@ __all__ = [
     "FlowMatchingLoss",
     "TrajectoryGenerator",
     "RK4Solver",
+    "L1ReactiveController",
+    "L1Config",
     
     # 接口系统
     "InterfaceRegistry",

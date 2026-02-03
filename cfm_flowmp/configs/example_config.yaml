@@ -1,0 +1,62 @@
+# CFM FlowMP 配置示例
+
+# 模型配置
+model:
+  variant: "base"  # small, base, large
+  state_dim: 2
+  max_seq_len: 64
+  hidden_dim: 256
+  num_layers: 6
+  num_heads: 8
+
+# L2 生成器配置
+l2_generator:
+  solver_type: "rk4"  # euler, midpoint, rk4, rk45
+  num_steps: 20
+  seq_len: 64
+  use_bspline_smoothing: true
+  bspline_degree: 3
+  bspline_num_control_points: 20
+  num_samples: 1
+
+# L1 控制器配置
+l1_controller:
+  n_samples_per_mode: 100
+  n_control_points: 10
+  time_horizon: 5.0
+  n_timesteps: 50
+  tube_radius: 0.5
+  tube_covariance: 0.1
+  w_semantic: 1.0
+  w_tube: 10.0
+  w_energy: 0.1
+  temperature: 1.0
+  energy_matrix_scale: 1.0
+  use_warm_start: true
+  warm_start_noise_scale: 0.1
+  shift_padding_mode: "extrapolate"  # zero, extrapolate
+
+# 推理配置
+inference:
+  device: "cuda"  # cuda, cpu
+  n_l2_samples: 5  # L2 生成的锚点数量
+  n_l1_iterations: 10  # L1 优化迭代次数
+  use_warm_start: true
+  batch_size: 1
+
+# 结果保存配置
+results:
+  save_dir: "results"
+  experiment_name: null  # null 表示自动生成
+  save_format: "pt"  # pt, pkl, npz
+  save_trajectories: true
+  save_metrics: true
+  save_config: true
+
+# 可视化配置
+visualization:
+  save_plots: true
+  plot_format: "png"
+  dpi: 150
+  show_plots: false
+
