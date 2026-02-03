@@ -160,7 +160,7 @@ def create_model(args):
         cost_map_latent_dim=256,
         cost_map_encoder_type='single_scale',
         use_style_conditioning=True,
-        style_dim=2,  # [w_safe, w_fast]
+        style_dim=3,  # [w_safety, w_energy, w_smooth]
         use_8step_schedule=True,
         # Unet-specific parameters
         unet_base_channels=args.unet_base_channels,

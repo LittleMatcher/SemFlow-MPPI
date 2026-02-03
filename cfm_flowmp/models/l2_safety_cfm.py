@@ -24,6 +24,7 @@ from .unet_1d import FlowMPUNet1D
 from .cost_map_encoder import CostMapEncoder, create_cost_map_encoder
 from .embeddings import ConditionEncoder
 from ..inference.ode_solver import RK4Solver, SolverConfig
+from ..inference.generator import BSplineSmoother
 
 
 @dataclass
@@ -64,6 +65,11 @@ class L2Config:
     # Safety constraints (CBF embedding)
     use_cbf_constraint: bool = True
     cbf_margin: float = 0.1  # Safety margin in meters
+    
+    # Trajectory smoothing
+    use_bspline_smoothing: bool = True  # Apply B-spline smoothing to generated trajectories
+    bspline_degree: int = 3  # B-spline degree (3 = cubic)
+    bspline_num_control_points: int = 20  # Number of control points for B-spline fitting
 
 
 class L2SafetyCFM(nn.Module):
@@ -72,15 +78,32 @@ class L2SafetyCFM(nn.Module):
     
     Generates multi-modal trajectory anchors for L1 MPPI optimization.
     
-    Inputs (from L3 VLM):
-        - e_map: Semantic cost map encoding
-        - x_goal: Target goal state
-        - w_style: Control style weights [w_safety, w_energy, w_smooth]
-        - x_curr: Current robot state [p_0, v_0, a_0]
+    This layer learns a conditional vector field v_θ(z, t, c) that maps from
+    noise to trajectory distributions, conditioned on semantic context.
+    
+    Inputs (Context c from L3 VLM):
+        - cost_map: [B, C, H, W] Semantic cost map (encoded to e_map)
+        - x_goal: [B, state_dim*2] Target goal state [p_goal, v_goal]
+        - w_style: [B, 3] Control style weights [w_safety, w_energy, w_smooth]
+        - x_curr: [B, state_dim*3] Current robot state [p_0, v_0, a_0]
+        - x_t: [B, T, state_dim*3] Interpolated state at flow time t
+        - t: [B] Flow time t ∈ [0, 1]
         
-    Outputs (to L1 MPPI):
-        - Trajectory anchors: {τ_i}_{i=1}^N
-        - Each trajectory: {[p_t, v_t, a_t]}_{t=0}^T
+    Network Output (Vector Field):
+        - v_pred: [B, T, state_dim*3] Predicted vector field
+            - Channels 0:state_dim = velocity field (p_dot)
+            - Channels state_dim:2*state_dim = acceleration field (p_ddot)
+            - Channels 2*state_dim:3*state_dim = jerk field (p_dddot)
+        
+    Integration Output (to L1 MPPI):
+        - Trajectory anchors: {τ_i}_{i=1}^N where N = num_samples
+        - Each trajectory τ: {[p_t, v_t, a_t]}_{t=0}^T
+        - Format: {
+            'trajectories': [B*N, T, state_dim],
+            'velocities': [B*N, T, state_dim],
+            'accelerations': [B*N, T, state_dim],
+            'full_states': [B*N, T, state_dim*3]
+          }
     """
     
     def __init__(self, config: L2Config):
@@ -151,6 +174,15 @@ class L2SafetyCFM(nn.Module):
             use_8step_schedule=config.use_8step_schedule,
         )
         self.ode_solver = RK4Solver(solver_config)
+        
+        # ========== Trajectory Smoother ==========
+        if config.use_bspline_smoothing:
+            self.smoother = BSplineSmoother(
+                degree=config.bspline_degree,
+                num_control_points=config.bspline_num_control_points,
+            )
+        else:
+            self.smoother = None
     
     def encode_cost_map(self, cost_map: torch.Tensor) -> torch.Tensor:
         """
@@ -290,15 +322,26 @@ class L2SafetyCFM(nn.Module):
         x_1 = self.ode_solver.solve(velocity_fn, x_0)  # [B*N, T, 6]
         
         # Step 7: Extract dynamics components
-        positions = x_1[..., :D]  # [B*N, T, 2]
-        velocities = x_1[..., D:D*2]  # [B*N, T, 2]
-        accelerations = x_1[..., D*2:]  # [B*N, T, 2]
+        positions_raw = x_1[..., :D]  # [B*N, T, 2]
+        velocities_raw = x_1[..., D:D*2]  # [B*N, T, 2]
+        accelerations_raw = x_1[..., D*2:]  # [B*N, T, 2]
+        
+        # Step 8: Apply B-spline smoothing if enabled
+        if self.smoother is not None:
+            smoothed = self.smoother.smooth(positions_raw, return_derivatives=True)
+            positions = smoothed['positions']
+            velocities = smoothed['velocities']
+            accelerations = smoothed['accelerations']
+        else:
+            positions = positions_raw
+            velocities = velocities_raw
+            accelerations = accelerations_raw
         
         return {
             'trajectories': positions,
             'velocities': velocities,
             'accelerations': accelerations,
-            'full_states': x_1,  # [B*N, T, 6] = [p, v, a]
+            'full_states': torch.cat([positions, velocities, accelerations], dim=-1),  # [B*N, T, 6] = [p, v, a]
             'num_samples_per_batch': N,
         }
     
@@ -314,16 +357,27 @@ class L2SafetyCFM(nn.Module):
         """
         Training forward pass.
         
+        Predicts the vector field v_θ(x_t, t, c) that describes the flow
+        from noise to trajectory distribution.
+        
         Args:
-            x_t: [B, T, 6] interpolated state
-            t: [B] flow time
-            cost_map: [B, C, H, W] cost map
-            x_curr: [B, 6] current state
-            x_goal: [B, 4] goal state
-            w_style: [B, 3] style weights
+            x_t: [B, T, state_dim*3] Interpolated state at flow time t
+                 Contains [p_t, v_t, a_t] concatenated
+            t: [B] Flow time values t ∈ [0, 1]
+            cost_map: [B, C, H, W] Semantic cost map from L3
+            x_curr: [B, state_dim*3] Current robot state [p_0, v_0, a_0]
+            x_goal: [B, state_dim*2] Goal state [p_goal, v_goal]
+            w_style: [B, 3] Control style weights [w_safety, w_energy, w_smooth]
             
         Returns:
-            Predicted vector field [B, T, 6]
+            Predicted vector field [B, T, state_dim*3]
+            - Channels 0:state_dim = velocity field (p_dot)
+            - Channels state_dim:2*state_dim = acceleration field (p_ddot)
+            - Channels 2*state_dim:3*state_dim = jerk field (p_dddot)
+            
+        Note:
+            This is the vector field that, when integrated via ODE solver
+            from t=0 to t=1, produces the trajectory anchors for L1 MPPI.
         """
         # Encode cost map
         e_map = self.encode_cost_map(cost_map)

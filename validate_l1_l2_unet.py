@@ -95,7 +95,7 @@ def load_model(checkpoint_path, device, model_type=None):
             cost_map_latent_dim=256,
             cost_map_encoder_type='single_scale',
             use_style_conditioning=True,
-            style_dim=2,
+            style_dim=3,  # [w_safety, w_energy, w_smooth]
             use_8step_schedule=True,
             unet_base_channels=128,
             unet_channel_mults=(1, 2, 4, 8),
@@ -112,7 +112,7 @@ def load_model(checkpoint_path, device, model_type=None):
             cost_map_latent_dim=256,
             cost_map_encoder_type='single_scale',
             use_style_conditioning=True,
-            style_dim=2,
+            style_dim=3,  # [w_safety, w_energy, w_smooth]
             use_8step_schedule=True,
         )
     

@@ -57,7 +57,14 @@ datasets/
 *.npy
 *.pkl
 *.pickle
-
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.ico
+*.webp
 # Logs
 logs/
 *.log
@@ -72,3 +79,7 @@ Thumbs.db
 *.tmp
 *.temp
 tmp/
+
+# Markdown files
+
+*.md

@@ -2,7 +2,7 @@
 流匹配训练逻辑
 
 实现用于轨迹生成的核心流匹配算法：
-1. 插值路径构建（FlowMP 的公式 6, 8, 10）
+1. 插值路径构建
 2. 目标场计算
 3. 流匹配损失
 
@@ -241,7 +241,6 @@ class FlowInterpolator:
         q_ddot_t = t_expanded * q_ddot_1 + (1 - t_expanded) * epsilon_q_ddot
         
         # ============ 计算目标场 ============
-        # 根据 FlowMP 算法 1:
         # u_target = (q_1 - q_t) / (1 - t)
         # v_target = (q_dot_1 - q_dot_t) / (1 - t)
         # w_target = (q_ddot_1 - q_ddot_t) / (1 - t)
@@ -283,7 +282,6 @@ class FlowInterpolator:
 
 class FlowMatchingLoss(nn.Module):
     """
-    FlowMP 的流匹配损失
     
     计算预测和目标向量场之间的加权 MSE 损失:
     

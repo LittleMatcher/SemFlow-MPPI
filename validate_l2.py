@@ -57,8 +57,11 @@ def load_model(checkpoint_path, device):
         cost_map_latent_dim=256,
         cost_map_encoder_type='single_scale',
         use_style_conditioning=True,
-        style_dim=2,
+        style_dim=3,  # [w_safety, w_energy, w_smooth]
         use_8step_schedule=True,
+        use_bspline_smoothing=True,  # Enable B-spline smoothing for smooth trajectories
+        bspline_degree=3,
+        bspline_num_control_points=20,
     )
     
     # Load checkpoint
