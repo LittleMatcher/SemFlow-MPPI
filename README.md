@@ -251,8 +251,7 @@ SemFlow-MPPI是一个三层分层架构，融合语义理解、流匹配轨迹�
 
 ### Transformer Vector Field Prediction
 
-Based on "Unified Generation-Refinement Planning" and FlowMP official implementation.
-
+```
 ┌─────────────────────────────────────────┐
 │      Trajectory Tokenizer (Linear)      │
 │         [B, T, 6] → [B, T, D]           │
