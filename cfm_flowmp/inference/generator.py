@@ -1,10 +1,10 @@
 """
-Trajectory Generator for FlowMP
+FlowMP 轨迹生成器
 
-Complete trajectory generation pipeline:
-1. Sample initial noise
-2. Solve ODE from t=0 to t=1
-3. Post-process with B-spline smoothing for physical consistency
+完整的轨迹生成流程：
+1. 采样初始噪声
+2. 从 t=0 到 t=1 求解 ODE
+3. 使用 B 样条平滑进行后处理以确保物理一致性
 """
 
 import torch
@@ -18,57 +18,57 @@ from .ode_solver import RK4Solver, SolverConfig, create_solver
 
 @dataclass
 class GeneratorConfig:
-    """Configuration for trajectory generator."""
+    """轨迹生成器配置"""
     
-    # Solver settings
+    # 求解器设置
     solver_type: str = "rk4"
-    num_steps: int = 20  # Used for uniform stepping
+    num_steps: int = 20  # 用于均匀步进
     
-    # Time schedule (as per "Unified Generation-Refinement Planning")
-    # Non-uniform schedule: large steps early, small steps near t=1
-    use_8step_schedule: bool = True  # Use aggressive 8-step schedule by default
-    custom_time_schedule: list = None  # Override with custom schedule
+    # 时间调度（按照"统一生成-细化规划"方法）
+    # 非均匀调度：早期大步长，接近 t=1 时小步长
+    use_8step_schedule: bool = True  # 默认使用激进的 8 步调度
+    custom_time_schedule: list = None  # 使用自定义调度覆盖
     
-    # Custom time schedule (overrides num_steps if provided)
-    # Example: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0] for 8-step schedule
-    # This non-uniform schedule uses larger steps early and smaller steps near t=1
-    # for better fine-grained control in the refinement phase
+    # 自定义时间调度（如果提供则覆盖 num_steps）
+    # 示例：8 步调度为 [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+    # 此非均匀调度在早期使用较大步长，在接近 t=1 时使用较小步长
+    # 以便在细化阶段获得更好的细粒度控制
     time_schedule: Optional[List[float]] = None
     
-    # State dimensions
+    # 状态维度
     state_dim: int = 2
     seq_len: int = 64
     
-    # Smoothing (B-spline fitting for physical consistency)
+    # 平滑（B 样条拟合以确保物理一致性）
     use_bspline_smoothing: bool = True
     bspline_degree: int = 3
     bspline_num_control_points: int = 20
     
-    # Sampling
-    num_samples: int = 1  # Number of trajectories to generate per condition
+    # 采样
+    num_samples: int = 1  # 每个条件生成的轨迹数量
     
-    # ============ Warm-Start (On-Policy) Settings ============
-    # Implements "short-term memory" policy continuation similar to On-Policy RL
-    # The optimal trajectory from time t becomes a strong prior at time t+1
-    enable_warm_start: bool = False  # Enable temporal warm-start mechanism
-    warm_start_noise_scale: float = 0.1  # Noise scale for warm-started initial state
+    # ============ 热启动（同策略）设置 ============
+    # 实现"短期记忆"策略延续，类似于同策略强化学习
+    # 时间 t 的最优轨迹成为时间 t+1 的强先验
+    enable_warm_start: bool = False  # 启用时间热启动机制
+    warm_start_noise_scale: float = 0.1  # 热启动初始状态的噪声尺度
     warm_start_shift_mode: str = "zero_pad"  # 'zero_pad', 'repeat_last', 'predict'
-    warm_start_memory_length: int = 1  # Number of previous trajectories to remember
+    warm_start_memory_length: int = 1  # 要记住的先前轨迹数量
 
 
-# 8-step schedule from "Unified Generation-Refinement Planning"
-# Front-loaded: large steps early (exploration), small steps late (refinement)
+# 来自"统一生成-细化规划"的 8 步调度
+# 前载式：早期大步长（探索），后期小步长（细化）
 DEFAULT_8STEP_SCHEDULE = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 
 
 class BSplineSmoother:
     """
-    B-spline smoothing for trajectory post-processing.
+    B 样条平滑器，用于轨迹后处理
     
-    Fits a B-spline to the generated trajectory to ensure:
-    - Smoothness (continuous derivatives)
-    - Physical consistency
-    - Reduced noise from ODE integration errors
+    将 B 样条拟合到生成的轨迹，以确保：
+    - 平滑性（连续导数）
+    - 物理一致性
+    - 减少来自 ODE 积分误差的噪声
     """
     
     def __init__(
@@ -77,9 +77,9 @@ class BSplineSmoother:
         num_control_points: int = 20,
     ):
         """
-        Args:
-            degree: B-spline degree (3 = cubic)
-            num_control_points: Number of control points for fitting
+        参数:
+            degree: B 样条次数（3 = 三次）
+            num_control_points: 用于拟合的控制点数量
         """
         self.degree = degree
         self.num_control_points = num_control_points
@@ -90,14 +90,14 @@ class BSplineSmoother:
         return_derivatives: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
-        Smooth trajectory using B-spline fitting.
+        使用 B 样条拟合平滑轨迹
         
-        Args:
-            trajectory: Position trajectory [B, T, D]
-            return_derivatives: Whether to compute velocity and acceleration
+        参数:
+            trajectory: 位置轨迹 [B, T, D]
+            return_derivatives: 是否计算速度和加速度
             
-        Returns:
-            Dictionary with smoothed 'positions', 'velocities', 'accelerations'
+        返回:
+            包含平滑后的 'positions', 'velocities', 'accelerations' 的字典
         """
         B, T, D = trajectory.shape
         device = trajectory.device
@@ -113,18 +113,18 @@ class BSplineSmoother:
             smoothed_velocities = []
             smoothed_accelerations = []
             
-            # Parameter values for the trajectory points
+            # 轨迹点的参数值
             t_eval = np.linspace(0, 1, T)
             
             for b in range(B):
                 traj_b = traj_np[b]  # [T, D]
                 
-                # Transpose for splprep: expects [D, T]
+                # 转置以供 splprep 使用：期望 [D, T]
                 traj_b_t = traj_b.T
                 
-                # Fit B-spline
-                # s=0 for interpolation, s>0 for smoothing
-                smoothing_factor = max(0, T - np.sqrt(2 * T))  # Adaptive smoothing
+                # 拟合 B 样条
+                # s=0 表示插值，s>0 表示平滑
+                smoothing_factor = max(0, T - np.sqrt(2 * T))  # 自适应平滑
                 
                 try:
                     tck, u = splprep(
@@ -133,15 +133,15 @@ class BSplineSmoother:
                         s=smoothing_factor,
                     )
                     
-                    # Evaluate at original parameter values
+                    # 在原始参数值处评估
                     pos = np.array(splev(t_eval, tck)).T  # [T, D]
                     
                     if return_derivatives:
-                        # First derivative (velocity)
+                        # 一阶导数（速度）
                         vel = np.array(splev(t_eval, tck, der=1)).T
-                        vel = vel / (T - 1)  # Scale by time step
+                        vel = vel / (T - 1)  # 按时间步长缩放
                         
-                        # Second derivative (acceleration)
+                        # 二阶导数（加速度）
                         acc = np.array(splev(t_eval, tck, der=2)).T
                         acc = acc / ((T - 1) ** 2)
                         
@@ -151,10 +151,10 @@ class BSplineSmoother:
                     smoothed_positions.append(pos)
                     
                 except Exception as e:
-                    # If spline fitting fails, use original trajectory
+                    # 如果样条拟合失败，使用原始轨迹
                     smoothed_positions.append(traj_b)
                     if return_derivatives:
-                        # Compute numerical derivatives
+                        # 计算数值导数
                         vel = np.gradient(traj_b, axis=0)
                         acc = np.gradient(vel, axis=0)
                         smoothed_velocities.append(vel)
@@ -181,7 +181,7 @@ class BSplineSmoother:
             return result
             
         except ImportError:
-            # Fallback to simple moving average if scipy not available
+            # 如果 scipy 不可用，回退到简单移动平均
             return self._smooth_moving_average(trajectory, return_derivatives)
     
     def _smooth_moving_average(
@@ -191,11 +191,11 @@ class BSplineSmoother:
         window_size: int = 5,
     ) -> Dict[str, torch.Tensor]:
         """
-        Simple moving average smoothing fallback.
+        简单移动平均平滑回退方法
         """
         B, T, D = trajectory.shape
         
-        # Pad and apply moving average
+        # 填充并应用移动平均
         pad = window_size // 2
         padded = torch.nn.functional.pad(
             trajectory.permute(0, 2, 1),  # [B, D, T]
@@ -203,7 +203,7 @@ class BSplineSmoother:
             mode='replicate'
         )
         
-        # Moving average via conv1d
+        # 通过 conv1d 进行移动平均
         kernel = torch.ones(1, 1, window_size, device=trajectory.device) / window_size
         
         smoothed = []
@@ -220,7 +220,7 @@ class BSplineSmoother:
         result = {'positions': positions}
         
         if return_derivatives:
-            # Numerical derivatives
+            # 数值导数
             velocities = torch.gradient(positions, dim=1)[0]
             accelerations = torch.gradient(velocities, dim=1)[0]
             result['velocities'] = velocities
@@ -231,21 +231,21 @@ class BSplineSmoother:
 
 class TrajectoryGenerator:
     """
-    Complete trajectory generation pipeline for FlowMP.
+    FlowMP 完整轨迹生成流程
     
-    Generates trajectories by:
-    1. Sampling initial noise from N(0, I)
-    2. Solving the ODE dx/dt = v_θ(x, t, c) from t=0 to t=1
-    3. Optionally smoothing with B-splines for physical consistency
+    通过以下方式生成轨迹：
+    1. 从 N(0, I) 采样初始噪声
+    2. 从 t=0 到 t=1 求解 ODE dx/dt = v_θ(x, t, c)
+    3. 可选地使用 B 样条平滑以确保物理一致性
     
-    **Warm-Start (On-Policy) Feature:**
-    When enabled, implements temporal continuity similar to On-Policy RL:
-    - At time t, MPPI outputs optimal control sequence u*_t
-    - At time t+1, u*_t is shifted forward to create prior ũ_t+1
-    - CFM starts from noised version of ũ_t+1 instead of pure Gaussian noise
-    - This creates "policy continuation" where decisions build on previous steps
+    **热启动（同策略）特性：**
+    启用后，实现类似于同策略强化学习的时间连续性：
+    - 在时间 t，MPPI 输出最优控制序列 u*_t
+    - 在时间 t+1，u*_t 向前移位以创建先验 ũ_t+1
+    - CFM 从 ũ_t+1 的加噪版本开始，而不是纯高斯噪声
+    - 这创建了"策略延续"，其中决策建立在先前步骤的基础上
     
-    Usage:
+    用法:
         generator = TrajectoryGenerator(model, config)
         trajectories = generator.generate(
             start_pos, goal_pos, start_vel
@@ -258,35 +258,35 @@ class TrajectoryGenerator:
         config: GeneratorConfig = None,
     ):
         """
-        Initialize trajectory generator.
+        初始化轨迹生成器
         
-        Args:
-            model: Trained FlowMP transformer model
-            config: Generator configuration
+        参数:
+            model: 训练好的 FlowMP transformer 模型
+            config: 生成器配置
         """
         self.model = model
         self.config = config or GeneratorConfig()
         
-        # Determine time schedule
+        # 确定时间调度
         if self.config.custom_time_schedule is not None:
             time_schedule = self.config.custom_time_schedule
         elif self.config.use_8step_schedule:
             time_schedule = DEFAULT_8STEP_SCHEDULE
         else:
-            time_schedule = None  # Use uniform stepping
+            time_schedule = None  # 使用均匀步进
         
-        # Create ODE solver with time schedule
+        # 创建带时间调度的 ODE 求解器
         solver_config = SolverConfig(
             num_steps=self.config.num_steps,
-            time_schedule=time_schedule,  # Use computed time_schedule
+            time_schedule=time_schedule,  # 使用计算出的 time_schedule
             return_trajectory=False,
             use_8step_schedule=self.config.use_8step_schedule,
         )
         self.solver = create_solver(self.config.solver_type, solver_config)
         self.time_schedule = time_schedule
         
-        # Create B-spline smoother for physical consistency
-        # As per spec: "output smoothing via B-spline to eliminate numerical drift"
+        # 创建 B 样条平滑器以确保物理一致性
+        # 按照规范："通过 B 样条进行输出平滑以消除数值漂移"
         if self.config.use_bspline_smoothing:
             self.smoother = BSplineSmoother(
                 degree=self.config.bspline_degree,
@@ -295,9 +295,9 @@ class TrajectoryGenerator:
         else:
             self.smoother = None
         
-        # ============ Warm-Start Memory ============
-        # Stores the most recent optimal trajectory for temporal warm-start
-        # This implements "short-term memory" similar to On-Policy RL
+        # ============ 热启动内存 ============
+        # 存储最近的最优轨迹用于时间热启动
+        # 这实现了类似于同策略强化学习的"短期记忆"
         self.warm_start_cache: Optional[Dict[str, torch.Tensor]] = None
         self.warm_start_timestep: int = 0
     
@@ -306,35 +306,35 @@ class TrajectoryGenerator:
         trajectory: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Shift trajectory forward in time by one step (temporal shift operation).
+        将轨迹在时间上向前移动一步（时间移位操作）
         
-        Implements the "shift operation" from On-Policy RL warm-start:
-        - Discard the first control/state (already executed)
-        - Shift remaining sequence forward
-        - Pad the end according to shift_mode
+        实现来自同策略强化学习热启动的"移位操作"：
+        - 丢弃第一个控制/状态（已执行）
+        - 将剩余序列向前移位
+        - 根据 shift_mode 填充末尾
         
-        Args:
-            trajectory: Control/state sequence [B, T, D]
+        参数:
+            trajectory: 控制/状态序列 [B, T, D]
             
-        Returns:
-            Shifted trajectory [B, T, D]
+        返回:
+            移位后的轨迹 [B, T, D]
         """
         B, T, D = trajectory.shape
         device = trajectory.device
         dtype = trajectory.dtype
         
-        # Shift: remove first timestep, append new last timestep
+        # 移位：移除第一个时间步，追加新的最后一个时间步
         shifted = trajectory[:, 1:, :]  # [B, T-1, D]
         
-        # Pad the end based on shift_mode
+        # 根据 shift_mode 填充末尾
         if self.config.warm_start_shift_mode == "zero_pad":
-            # Append zeros (deceleration/stopping)
+            # 追加零（减速/停止）
             padding = torch.zeros(B, 1, D, device=device, dtype=dtype)
         elif self.config.warm_start_shift_mode == "repeat_last":
-            # Repeat last state (constant velocity/control)
+            # 重复最后一个状态（恒定速度/控制）
             padding = trajectory[:, -1:, :]
         elif self.config.warm_start_shift_mode == "predict":
-            # Linear extrapolation from last two steps
+            # 从最后两个步骤进行线性外推
             if T >= 2:
                 last_two = trajectory[:, -2:, :]
                 delta = last_two[:, 1:] - last_two[:, 0:1]
@@ -342,7 +342,7 @@ class TrajectoryGenerator:
             else:
                 padding = trajectory[:, -1:, :]
         else:
-            raise ValueError(f"Unknown shift_mode: {self.config.warm_start_shift_mode}")
+            raise ValueError(f"未知的 shift_mode: {self.config.warm_start_shift_mode}")
         
         shifted_traj = torch.cat([shifted, padding], dim=1)  # [B, T, D]
         return shifted_traj
@@ -354,23 +354,23 @@ class TrajectoryGenerator:
         dtype: torch.dtype,
     ) -> torch.Tensor:
         """
-        Create warm-started initial state from cached trajectory.
+        从缓存的轨迹创建热启动初始状态
         
-        Implements the "noised prior" from On-Policy RL:
-        - Take cached optimal trajectory from t-1
-        - Shift it forward in time
-        - Add controlled noise to maintain exploration
+        实现来自同策略强化学习的"加噪先验"：
+        - 从 t-1 获取缓存的最优轨迹
+        - 在时间上向前移位
+        - 添加受控噪声以保持探索
         
-        Args:
-            batch_size: Batch size
-            device: Device
-            dtype: Data type
+        参数:
+            batch_size: 批次大小
+            device: 设备
+            dtype: 数据类型
             
-        Returns:
-            Warm-started initial state x_0 [B, T, D*3]
+        返回:
+            热启动初始状态 x_0 [B, T, D*3]
         """
         if self.warm_start_cache is None:
-            # No cache, return pure Gaussian noise
+            # 无缓存，返回纯高斯噪声
             return torch.randn(
                 batch_size, 
                 self.config.seq_len, 
@@ -379,10 +379,10 @@ class TrajectoryGenerator:
                 dtype=dtype
             )
         
-        # Shift cached trajectory forward
+        # 将缓存的轨迹向前移位
         cached_state = self.warm_start_cache['raw_output']  # [B_cache, T, D*3]
         
-        # Handle batch size mismatch (repeat if needed)
+        # 处理批次大小不匹配（如需要则重复）
         B_cache = cached_state.shape[0]
         if B_cache < batch_size:
             repeat_factor = (batch_size + B_cache - 1) // B_cache
@@ -390,10 +390,10 @@ class TrajectoryGenerator:
         elif B_cache > batch_size:
             cached_state = cached_state[:batch_size]
         
-        # Shift forward in time
+        # 在时间上向前移位
         shifted_prior = self._shift_trajectory_forward(cached_state)
         
-        # Add exploration noise (scaled Gaussian)
+        # 添加探索噪声（缩放的高斯噪声）
         noise = torch.randn_like(shifted_prior) * self.config.warm_start_noise_scale
         warm_start_x0 = shifted_prior + noise
         
@@ -404,14 +404,14 @@ class TrajectoryGenerator:
         optimal_trajectory: Dict[str, torch.Tensor],
     ):
         """
-        Update warm-start cache with latest optimal trajectory.
+        使用最新的最优轨迹更新热启动缓存
         
-        This should be called after MPPI optimization produces u*_t.
-        In a full implementation, this would be called by the L1 MPPI layer.
+        这应该在 MPPI 优化产生 u*_t 之后调用。
+        在完整实现中，这应该由 L1 MPPI 层调用。
         
-        Args:
-            optimal_trajectory: Dictionary containing the optimal trajectory
-                - Must include 'raw_output' key with full state [B, T, D*3]
+        参数:
+            optimal_trajectory: 包含最优轨迹的字典
+                - 必须包含 'raw_output' 键，值为完整状态 [B, T, D*3]
         """
         self.warm_start_cache = {
             'raw_output': optimal_trajectory['raw_output'].detach().clone(),
@@ -421,9 +421,9 @@ class TrajectoryGenerator:
     
     def reset_warm_start(self):
         """
-        Reset warm-start cache.
+        重置热启动缓存
         
-        Call this when starting a new episode or when trajectory continuity breaks.
+        在开始新回合或轨迹连续性中断时调用此方法。
         """
         self.warm_start_cache = None
         self.warm_start_timestep = 0
@@ -435,20 +435,20 @@ class TrajectoryGenerator:
         start_vel: Optional[torch.Tensor] = None,
     ):
         """
-        Create a velocity function for the ODE solver.
+        为 ODE 求解器创建速度函数
         
-        The velocity function wraps the model and handles conditioning.
+        速度函数包装模型并处理条件化。
         """
         def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             """
-            Compute velocity at state x_t and time t.
+            计算状态 x_t 和时间 t 处的速度
             
-            Args:
-                x_t: Current state [B, T, 6] (pos, vel, acc)
-                t: Current time [B]
+            参数:
+                x_t: 当前状态 [B, T, 6] (位置, 速度, 加速度)
+                t: 当前时间 [B]
                 
-            Returns:
-                Velocity field [B, T, 6]
+            返回:
+                速度场 [B, T, 6]
             """
             with torch.no_grad():
                 output = self.model(
@@ -473,40 +473,40 @@ class TrajectoryGenerator:
         warm_start_state: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Generate trajectories for given conditions.
+        为给定条件生成轨迹
         
-        Args:
-            start_pos: Starting positions [B, D]
-            goal_pos: Goal positions [B, D]
-            start_vel: Starting velocities [B, D] (optional)
-            num_samples: Number of samples per condition. 
-                        When > 1, generates multiple trajectories per condition.
-                        Output batch size becomes B * num_samples.
-            return_raw: Whether to include raw (unsmoothed) trajectory outputs in the
-                       returned dictionary. If False, only smoothed trajectories are returned.
-                       Note: Raw outputs are always computed internally for warm-start purposes,
-                       but are only included in the return dict when return_raw=True.
+        参数:
+            start_pos: 起始位置 [B, D]
+            goal_pos: 目标位置 [B, D]
+            start_vel: 起始速度 [B, D] (可选)
+            num_samples: 每个条件的样本数
+                        当 > 1 时，为每个条件生成多个轨迹
+                        输出批次大小变为 B * num_samples
+            return_raw: 是否在返回的字典中包含原始（未平滑）轨迹输出
+                       如果为 False，仅返回平滑后的轨迹
+                        注意：原始输出始终在内部计算（用于热启动），
+                        但仅在 return_raw=True 时包含在返回字典中
             
-        Returns:
-            Dictionary containing:
-                - 'positions': Generated position trajectories [B*num_samples, T, D]
-                  When num_samples=1: [B, T, D]
-                  When num_samples>1: [B*num_samples, T, D] (K anchor trajectories for L1)
-                - 'velocities': Generated velocity trajectories [B*num_samples, T, D]
-                - 'accelerations': Generated acceleration trajectories [B*num_samples, T, D]
-                - 'raw_output': Raw model output [B*num_samples, T, D*3] (only if return_raw=True)
-                - 'raw_positions': Raw positions before smoothing [B*num_samples, T, D] (only if return_raw=True)
-                - 'raw_velocities': Raw velocities before smoothing [B*num_samples, T, D] (only if return_raw=True)
-                - 'raw_accelerations': Raw accelerations before smoothing [B*num_samples, T, D] (only if return_raw=True)
+        返回:
+            包含以下内容的字典:
+                - 'positions': 生成的位置轨迹 [B*num_samples, T, D]
+                  当 num_samples=1 时: [B, T, D]
+                  当 num_samples>1 时: [B*num_samples, T, D] (L1 的 K 个锚点轨迹)
+                - 'velocities': 生成的速度轨迹 [B*num_samples, T, D]
+                - 'accelerations': 生成的加速度轨迹 [B*num_samples, T, D]
+                - 'raw_output': 原始模型输出 [B*num_samples, T, D*3] (仅当 return_raw=True)
+                - 'raw_positions': 平滑前的位置 [B*num_samples, T, D] (仅当 return_raw=True)
+                - 'raw_velocities': 平滑前的速度 [B*num_samples, T, D] (仅当 return_raw=True)
+                - 'raw_accelerations': 平滑前的加速度 [B*num_samples, T, D] (仅当 return_raw=True)
                 
-        Note:
-            This method is designed to work with L1 MPPI layer:
-            - When num_samples > 1, the output contains K = B*num_samples anchor trajectories
-            - L1 layer can directly use these as anchors: initialize_from_l2_output(l2_output)
+        注意:
+            此方法设计用于与 L1 MPPI 层配合：
+            - 当 num_samples > 1 时，输出包含 K = B*num_samples 个锚点轨迹
+            - L1 层可以直接使用这些作为锚点: initialize_from_l2_output(l2_output)
         """
         self.model.eval()
         
-        B_original = start_pos.shape[0]  # Original batch size (before num_samples expansion)
+        B_original = start_pos.shape[0]  # 原始批次大小（在 num_samples 扩展之前）
         D = self.config.state_dim
         T = self.config.seq_len
         device = start_pos.device
@@ -514,80 +514,80 @@ class TrajectoryGenerator:
         
         num_samples = num_samples or self.config.num_samples
         
-        # Handle multiple samples per condition
+        # 处理每个条件的多个样本
         if num_samples > 1:
             start_pos = start_pos.repeat(num_samples, 1)
             goal_pos = goal_pos.repeat(num_samples, 1)
             if start_vel is not None:
                 start_vel = start_vel.repeat(num_samples, 1)
-            B = B_original * num_samples  # Expanded batch size
+            B = B_original * num_samples  # 扩展后的批次大小
         else:
-            B = B_original  # No expansion needed
+            B = B_original  # 无需扩展
         
-        # ============ Warm-Start Initial State ============
-        # Sample or initialize initial state x_0.
-        # Priority:
-        #   1) Explicit warm_start_state (from L1 / external controller)
-        #   2) Internal warm-start cache (GeneratorConfig.enable_warm_start)
-        #   3) Standard CFM: pure Gaussian noise N(0, I)
+        # ============ 热启动初始状态 ============
+        # 采样或初始化初始状态 x_0
+        # 优先级:
+        #   1) 显式 warm_start_state (来自 L1 / 外部控制器)
+        #   2) 内部热启动缓存 (GeneratorConfig.enable_warm_start)
+        #   3) 标准 CFM: 纯高斯噪声 N(0, I)
         if warm_start_state is not None:
-            # Accept shapes:
-            #   [T, D*3] -> broadcast to [B, T, D*3]
-            #   [1, T, D*3] -> broadcast to [B, T, D*3]
-            #   [B_original, T, D*3] -> repeat to [B_original*num_samples, T, D*3] if num_samples>1
-            #   [B, T, D*3] -> use as is (already matches expanded batch size)
+            # 接受的形状:
+            #   [T, D*3] -> 广播到 [B, T, D*3]
+            #   [1, T, D*3] -> 广播到 [B, T, D*3]
+            #   [B_original, T, D*3] -> 如果 num_samples>1 则重复到 [B_original*num_samples, T, D*3]
+            #   [B, T, D*3] -> 直接使用（已匹配扩展后的批次大小）
             ws = warm_start_state
             if ws.dim() == 2:
                 ws = ws.unsqueeze(0)
             if ws.shape[-1] != D * 3 or ws.shape[-2] != T:
                 raise ValueError(
-                    f"warm_start_state must have shape [*, {T}, {D*3}], "
-                    f"got {tuple(ws.shape)}"
+                    f"warm_start_state 必须具有形状 [*, {T}, {D*3}], "
+                    f"得到 {tuple(ws.shape)}"
                 )
             ws = ws.to(device=device, dtype=dtype)
             
-            # Handle different input shapes
+            # 处理不同的输入形状
             ws_batch_size = ws.shape[0]
             
-            # Case 1: Single trajectory [1, T, D*3] -> broadcast to full batch
+            # 情况 1: 单个轨迹 [1, T, D*3] -> 广播到完整批次
             if ws_batch_size == 1 and B > 1:
                 ws = ws.repeat(B, 1, 1)
-            # Case 2: Per-condition warm-start [B_original, T, D*3] -> expand for num_samples
+            # 情况 2: 每个条件的热启动 [B_original, T, D*3] -> 为 num_samples 扩展
             elif ws_batch_size == B_original and num_samples > 1:
                 ws = ws.repeat_interleave(num_samples, dim=0)
-            # Case 3: Already matches expanded batch size [B, T, D*3] -> use as is
+            # 情况 3: 已匹配扩展后的批次大小 [B, T, D*3] -> 直接使用
             elif ws_batch_size == B:
-                pass  # Already correct shape
-            # Case 4: Invalid shape
+                pass  # 形状已正确
+            # 情况 4: 无效形状
             else:
                 raise ValueError(
-                    f"Incompatible warm_start_state batch size {ws_batch_size}. "
-                    f"Expected one of: 1, {B_original} (per-condition), or {B} (full batch). "
-                    f"Got shape {tuple(ws.shape)} for B_original={B_original}, num_samples={num_samples}, B={B}"
+                    f"不兼容的 warm_start_state 批次大小 {ws_batch_size}。 "
+                    f"期望以下之一: 1, {B_original} (每个条件), 或 {B} (完整批次)。 "
+                    f"对于 B_original={B_original}, num_samples={num_samples}, B={B} 得到形状 {tuple(ws.shape)}"
                 )
             x_0 = ws
         elif self.config.enable_warm_start:
-            # Use internal warm-start cache: shifted prior + noise
+            # 使用内部热启动缓存: 移位先验 + 噪声
             x_0 = self._create_warm_start_prior(B, device, dtype)
         else:
-            # Standard CFM: sample from N(0, I)
-            # State has 6 channels: pos(2) + vel(2) + acc(2)
+            # 标准 CFM: 从 N(0, I) 采样
+            # 状态有 6 个通道: 位置(2) + 速度(2) + 加速度(2)
             x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
         
-        # Create velocity function
+        # 创建速度函数
         velocity_fn = self._create_velocity_fn(start_pos, goal_pos, start_vel)
         
-        # Solve ODE
+        # 求解 ODE
         x_1 = self.solver.solve(velocity_fn, x_0)
         
-        # Extract components
+        # 提取组件
         positions_raw = x_1[..., :D]
         velocities_raw = x_1[..., D:D*2]
         accelerations_raw = x_1[..., D*2:D*3]
         
         result = {}
         
-        # Apply smoothing if enabled
+        # 如果启用则应用平滑
         if self.smoother is not None:
             smoothed = self.smoother.smooth(positions_raw, return_derivatives=True)
             result['positions'] = smoothed['positions']
@@ -598,11 +598,11 @@ class TrajectoryGenerator:
             result['velocities'] = velocities_raw
             result['accelerations'] = accelerations_raw
         
-        # Store raw outputs conditionally based on return_raw parameter
-        # Raw outputs are always computed (needed for smoothing), but only included
-        # in return dict if return_raw=True. This allows users to control output size.
-        # Note: For warm-start functionality, users should call update_warm_start_cache()
-        # with the raw_output from a previous generation (when return_raw=True).
+        # 根据 return_raw 参数有条件地存储原始输出
+        # 原始输出始终计算（平滑需要），但仅在 return_raw=True 时包含在返回字典中
+        # 这允许用户控制输出大小
+        # 注意: 对于热启动功能，用户应使用来自先前生成的 raw_output 调用 update_warm_start_cache()
+        # (当 return_raw=True 时)
         if return_raw:
             result['raw_positions'] = positions_raw
             result['raw_velocities'] = velocities_raw
@@ -621,27 +621,26 @@ class TrajectoryGenerator:
         obstacle_fn: Optional[callable] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Generate trajectories with classifier-free guidance.
+        使用分类器自由引导生成轨迹
         
-        Allows steering the generation towards desired properties
-        like obstacle avoidance.
+        允许将生成引导到期望的属性，如避障
         
-        Args:
-            start_pos: Starting positions [B, D]
-            goal_pos: Goal positions [B, D]
-            start_vel: Starting velocities [B, D]
-            guidance_scale: Scale for guidance (1.0 = no guidance)
-            obstacle_fn: Function that returns gradient for obstacle avoidance
+        参数:
+            start_pos: 起始位置 [B, D]
+            goal_pos: 目标位置 [B, D]
+            start_vel: 起始速度 [B, D]
+            guidance_scale: 引导尺度 (1.0 = 无引导)
+            obstacle_fn: 返回避障梯度的函数
             
-        Returns:
-            Dictionary containing:
-                - 'positions': Generated position trajectories [B, T, D]
-                - 'velocities': Generated velocity trajectories [B, T, D]
-                - 'accelerations': Generated acceleration trajectories [B, T, D]
-                - 'raw_output': Raw model output [B, T, D*3] (for consistency with generate())
+        返回:
+            包含以下内容的字典:
+                - 'positions': 生成的位置轨迹 [B, T, D]
+                - 'velocities': 生成的速度轨迹 [B, T, D]
+                - 'accelerations': 生成的加速度轨迹 [B, T, D]
+                - 'raw_output': 原始模型输出 [B, T, D*3] (与 generate() 保持一致)
         """
-        # Note: Full CFG requires model trained with condition dropout
-        # This is a simplified version with optional obstacle guidance
+        # 注意: 完整的 CFG 需要训练时使用条件丢弃的模型
+        # 这是带有可选避障引导的简化版本
         
         self.model.eval()
         
@@ -654,7 +653,7 @@ class TrajectoryGenerator:
         x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
         
         def guided_velocity_fn(x_t, t):
-            # Conditional velocity
+            # 条件速度
             v_cond = self.model(
                 x_t=x_t,
                 t=t,
@@ -663,7 +662,7 @@ class TrajectoryGenerator:
                 start_vel=start_vel,
             )
             
-            # Add obstacle avoidance gradient if provided
+            # 如果提供则添加避障梯度
             if obstacle_fn is not None and guidance_scale != 1.0:
                 x_t_clone = x_t.clone().requires_grad_(True)
                 obstacle_cost = obstacle_fn(x_t_clone[..., :D])
@@ -675,14 +674,14 @@ class TrajectoryGenerator:
                         create_graph=False
                     )[0]
                     
-                    # Apply guidance
+                    # 应用引导
                     v_cond = v_cond - guidance_scale * grad
             
             return v_cond
         
         x_1 = self.solver.solve(guided_velocity_fn, x_0)
         
-        # Extract and optionally smooth
+        # 提取并可选地平滑
         positions_raw = x_1[..., :D]
         
         result = {}
@@ -697,7 +696,7 @@ class TrajectoryGenerator:
             result['velocities'] = x_1[..., D:D*2]
             result['accelerations'] = x_1[..., D*2:D*3]
         
-        # Include raw output for consistency with generate() method
+        # 包含原始输出以与 generate() 方法保持一致
         result['raw_output'] = x_1
         result['raw_positions'] = positions_raw
         result['raw_velocities'] = x_1[..., D:D*2]
@@ -712,21 +711,21 @@ class TrajectoryGenerator:
         batch_size: int = 32,
     ) -> List[Dict[str, torch.Tensor]]:
         """
-        Generate trajectories for multiple conditions in batches.
+        批量生成多个条件的轨迹
         
-        Args:
-            conditions: List of condition dictionaries
-            batch_size: Maximum batch size for inference
+        参数:
+            conditions: 条件字典列表
+            batch_size: 推理的最大批次大小
             
-        Returns:
-            List of trajectory dictionaries
+        返回:
+            轨迹字典列表
         """
         results = []
         
         for i in range(0, len(conditions), batch_size):
             batch_conds = conditions[i:i+batch_size]
             
-            # Stack conditions
+            # 堆叠条件
             start_pos = torch.stack([c['start_pos'] for c in batch_conds])
             goal_pos = torch.stack([c['goal_pos'] for c in batch_conds])
             
@@ -734,10 +733,10 @@ class TrajectoryGenerator:
             if 'start_vel' in batch_conds[0]:
                 start_vel = torch.stack([c['start_vel'] for c in batch_conds])
             
-            # Generate
+            # 生成
             batch_result = self.generate(start_pos, goal_pos, start_vel)
             
-            # Split results
+            # 拆分结果
             for j in range(len(batch_conds)):
                 result = {
                     'positions': batch_result['positions'][j],
@@ -751,13 +750,13 @@ class TrajectoryGenerator:
 
 def create_8step_schedule() -> List[float]:
     """
-    Create the 8-step non-uniform time schedule as specified in the implementation strategy.
+    创建实现策略中指定的 8 步非均匀时间调度
     
-    This schedule uses larger steps early (coarse generation) and smaller steps
-    near t=1 (fine-grained refinement) to preserve more details in the final phase.
+    此调度在早期使用较大步长（粗生成），在接近 t=1 时使用较小步长（细粒度细化）
+    以在最终阶段保留更多细节
     
-    Returns:
-        List of time values: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+    返回:
+        时间值列表: [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
     """
     return [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 
@@ -767,14 +766,14 @@ def compute_trajectory_metrics(
     target: Dict[str, torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
-    Compute metrics for generated trajectories.
+    计算生成轨迹的指标
     
-    Args:
-        generated: Generated trajectory dictionary
-        target: Ground truth trajectory dictionary (optional)
+    参数:
+        generated: 生成的轨迹字典
+        target: 真实轨迹字典 (可选)
         
-    Returns:
-        Dictionary of metric values
+    返回:
+        指标值字典
     """
     metrics = {}
     
@@ -782,30 +781,30 @@ def compute_trajectory_metrics(
     velocities = generated['velocities']
     accelerations = generated['accelerations']
     
-    # Smoothness metrics (lower is better)
-    # Jerk: rate of change of acceleration
+    # 平滑度指标（越小越好）
+    # 急动度: 加速度的变化率
     if positions.dim() == 3:
         jerk = torch.diff(accelerations, dim=1)
         metrics['avg_jerk'] = jerk.norm(dim=-1).mean().item()
         
-        # Curvature variation
+        # 曲率变化
         vel_norm = velocities.norm(dim=-1, keepdim=True).clamp(min=1e-6)
         curvature = (velocities[..., 0] * accelerations[..., 1] - 
                     velocities[..., 1] * accelerations[..., 0]) / (vel_norm.squeeze(-1) ** 3)
         metrics['curvature_var'] = curvature.var(dim=1).mean().item()
     
-    # If target provided, compute errors
+    # 如果提供目标，计算误差
     if target is not None:
-        # Position error
+        # 位置误差
         pos_error = (generated['positions'] - target['positions']).norm(dim=-1)
         metrics['pos_mse'] = pos_error.pow(2).mean().item()
         metrics['pos_mae'] = pos_error.mean().item()
         
-        # Goal reaching error (final position)
+        # 目标到达误差（最终位置）
         goal_error = (generated['positions'][:, -1] - target['positions'][:, -1]).norm(dim=-1)
         metrics['goal_error'] = goal_error.mean().item()
         
-        # Velocity error
+        # 速度误差
         if 'velocities' in target:
             vel_error = (generated['velocities'] - target['velocities']).norm(dim=-1)
             metrics['vel_mse'] = vel_error.pow(2).mean().item()

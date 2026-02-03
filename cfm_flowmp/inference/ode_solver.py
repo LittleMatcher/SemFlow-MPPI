@@ -1,15 +1,15 @@
 """
-ODE Solvers for Flow Matching Inference
+流匹配推理的 ODE 求解器
 
-Implements numerical integration methods for solving the ODE:
+实现用于求解 ODE 的数值积分方法:
     dx/dt = v_θ(x_t, t, c)
 
-from t=0 to t=1 to generate trajectories.
+从 t=0 到 t=1 生成轨迹。
 
-Available solvers:
-- EulerSolver: Simple first-order method
-- RK4Solver: Classic 4th order Runge-Kutta (recommended)
-- AdaptiveRK45Solver: Adaptive step size RK45 method
+可用求解器:
+- EulerSolver: 简单的一阶方法
+- RK4Solver: 经典四阶龙格-库塔方法（推荐）
+- AdaptiveRK45Solver: 自适应步长 RK45 方法
 """
 
 import torch
@@ -20,32 +20,32 @@ from dataclasses import dataclass
 
 @dataclass
 class SolverConfig:
-    """Configuration for ODE solvers."""
+    """ODE 求解器配置"""
     
-    # Number of integration steps (for uniform stepping)
+    # 积分步数（用于均匀步进）
     num_steps: int = 20
     
-    # Time range
+    # 时间范围
     t_start: float = 0.0
     t_end: float = 1.0
     
-    # For adaptive solvers
+    # 用于自适应求解器
     atol: float = 1e-5
     rtol: float = 1e-5
     max_steps: int = 1000
     
-    # Whether to return intermediate states
+    # 是否返回中间状态
     return_trajectory: bool = False
     
-    # Custom time schedule (overrides num_steps if provided)
-    # Following "Unified Generation-Refinement Planning" approach
+    # 自定义时间调度（如果提供则覆盖 num_steps）
+    # 遵循"统一生成-细化规划"方法
     time_schedule: Optional[List[float]] = None
     
-    # Predefined schedules
-    use_8step_schedule: bool = False  # Use aggressive 8-step schedule
+    # 预定义调度
+    use_8step_schedule: bool = False  # 使用激进的 8 步调度
 
 
-# Predefined time schedules based on "Unified Generation-Refinement Planning"
+# 基于"统一生成-细化规划"的预定义时间调度
 SCHEDULE_8STEP = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 SCHEDULE_UNIFORM_10 = [i/10 for i in range(11)]
 SCHEDULE_UNIFORM_20 = [i/20 for i in range(21)]
@@ -53,12 +53,12 @@ SCHEDULE_UNIFORM_20 = [i/20 for i in range(21)]
 
 class EulerSolver:
     """
-    Euler method (first-order) ODE solver.
+    欧拉方法（一阶）ODE 求解器
     
-    Simple but less accurate. Useful for debugging and fast inference.
-    Supports custom time schedules for non-uniform stepping.
+    简单但精度较低。适用于调试和快速推理。
+    支持自定义时间调度以实现非均匀步进。
     
-    Update rule:
+    更新规则:
         x_{n+1} = x_n + dt * v(x_n, t_n)
     """
     
@@ -84,18 +84,18 @@ class EulerSolver:
         time_schedule: List[float] = None,
     ) -> torch.Tensor:
         """
-        Solve ODE using Euler method.
+        使用欧拉方法求解 ODE
         
-        Args:
-            velocity_fn: Function v(x, t) returning velocity at state x and time t
-            x_0: Initial state [B, T, D]
-            num_steps: Number of integration steps (overrides config)
-            time_schedule: Custom time schedule (overrides config)
+        参数:
+            velocity_fn: 函数 v(x, t)，返回状态 x 和时间 t 处的速度
+            x_0: 初始状态 [B, T, D]
+            num_steps: 积分步数（覆盖配置）
+            time_schedule: 自定义时间调度（覆盖配置）
             
-        Returns:
-            Final state x_1 at t=1
+        返回:
+            t=1 处的最终状态 x_1
         """
-        # Get time schedule
+        # 获取时间调度
         if time_schedule is not None:
             schedule = time_schedule
         else:
@@ -106,7 +106,7 @@ class EulerSolver:
         
         trajectory = [x.clone()] if self.config.return_trajectory else None
         
-        # Integrate through the time schedule
+        # 通过时间调度进行积分
         for i in range(len(schedule) - 1):
             t_curr = schedule[i]
             t_next = schedule[i + 1]
@@ -114,7 +114,7 @@ class EulerSolver:
             
             t = torch.full((B,), t_curr, device=x_0.device, dtype=x_0.dtype)
             
-            # Compute velocity and update
+            # 计算速度并更新
             v = velocity_fn(x, t)
             x = x + dt * v
             
@@ -129,15 +129,15 @@ class EulerSolver:
 
 class RK4Solver:
     """
-    Classic 4th-order Runge-Kutta ODE solver.
+    经典四阶龙格-库塔 ODE 求解器
     
-    Provides good balance between accuracy and computational cost.
-    This is the recommended solver for FlowMP inference.
+    在精度和计算成本之间提供良好平衡。
+    这是 FlowMP 推理的推荐求解器。
     
-    Supports both uniform stepping and custom time schedules as described
-    in "Unified Generation-Refinement Planning" (e.g., 8-step schedule).
+    支持均匀步进和自定义时间调度，如"统一生成-细化规划"中所述
+    （例如，8 步调度）。
     
-    Update rule (RK4):
+    更新规则 (RK4):
         k1 = v(x_n, t_n)
         k2 = v(x_n + dt/2 * k1, t_n + dt/2)
         k3 = v(x_n + dt/2 * k2, t_n + dt/2)
@@ -149,8 +149,8 @@ class RK4Solver:
         self.config = config or SolverConfig()
     
     def _get_time_schedule(self, num_steps: int = None) -> List[float]:
-        """Get the time schedule for ODE integration."""
-        # Priority: custom schedule > 8-step flag > uniform stepping
+        """获取 ODE 积分的时间调度"""
+        # 优先级: 自定义调度 > 8 步标志 > 均匀步进
         if self.config.time_schedule is not None:
             return self.config.time_schedule
         elif self.config.use_8step_schedule:
@@ -168,18 +168,18 @@ class RK4Solver:
         time_schedule: List[float] = None,
     ) -> torch.Tensor:
         """
-        Solve ODE using RK4 method.
+        使用 RK4 方法求解 ODE
         
-        Args:
-            velocity_fn: Function v(x, t) returning velocity at state x and time t
-            x_0: Initial state [B, T, D] or [B, D]
-            num_steps: Number of integration steps (overrides config, ignored if time_schedule provided)
-            time_schedule: Custom time schedule (overrides config)
+        参数:
+            velocity_fn: 函数 v(x, t)，返回状态 x 和时间 t 处的速度
+            x_0: 初始状态 [B, T, D] 或 [B, D]
+            num_steps: 积分步数（覆盖配置，如果提供 time_schedule 则忽略）
+            time_schedule: 自定义时间调度（覆盖配置）
             
-        Returns:
-            Final state x_1 at t=1, or trajectory if return_trajectory=True
+        返回:
+            t=1 处的最终状态 x_1，或如果 return_trajectory=True 则返回轨迹
         """
-        # Get time schedule
+        # 获取时间调度
         if time_schedule is not None:
             schedule = time_schedule
         else:
@@ -190,22 +190,22 @@ class RK4Solver:
         
         trajectory = [x.clone()] if self.config.return_trajectory else None
         
-        # Integrate through the time schedule
+        # 通过时间调度进行积分
         for i in range(len(schedule) - 1):
             t_curr = schedule[i]
             t_next = schedule[i + 1]
             dt = t_next - t_curr
             
-            # Current time as tensor
+            # 当前时间作为张量
             t = torch.full((B,), t_curr, device=x_0.device, dtype=x_0.dtype)
             
-            # RK4 stages
+            # RK4 阶段
             k1 = velocity_fn(x, t)
             k2 = velocity_fn(x + 0.5 * dt * k1, t + 0.5 * dt)
             k3 = velocity_fn(x + 0.5 * dt * k2, t + 0.5 * dt)
             k4 = velocity_fn(x + dt * k3, t + dt)
             
-            # Update state
+            # 更新状态
             x = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
             
             if trajectory is not None:
@@ -223,12 +223,12 @@ class RK4Solver:
         num_steps: int = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
         """
-        Solve ODE and return intermediate states and velocities.
+        求解 ODE 并返回中间状态和速度
         
-        Useful for debugging and visualization.
+        适用于调试和可视化
         
-        Returns:
-            Tuple of (final_state, states_list, velocities_list)
+        返回:
+            (最终状态, 状态列表, 速度列表) 的元组
         """
         num_steps = num_steps or self.config.num_steps
         dt = (self.config.t_end - self.config.t_start) / num_steps
@@ -247,7 +247,7 @@ class RK4Solver:
             k3 = velocity_fn(x + 0.5 * dt * k2, t + 0.5 * dt)
             k4 = velocity_fn(x + dt * k3, t + dt)
             
-            # Store average velocity for this step
+            # 存储此步骤的平均速度
             v_avg = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
             velocities.append(v_avg.clone())
             
@@ -262,18 +262,18 @@ class RK4Solver:
 
 class AdaptiveRK45Solver:
     """
-    Adaptive step-size RK45 (Dormand-Prince) solver.
+    自适应步长 RK45（Dormand-Prince）求解器
     
-    Automatically adjusts step size for accuracy/speed tradeoff.
-    More accurate but potentially slower than fixed-step RK4.
+    自动调整步长以平衡精度和速度。
+    比固定步长 RK4 更准确，但可能更慢。
     
-    Uses embedded RK4/RK5 pair for error estimation.
+    使用嵌入式 RK4/RK5 对进行误差估计。
     """
     
     def __init__(self, config: SolverConfig = None):
         self.config = config or SolverConfig()
         
-        # Dormand-Prince coefficients
+        # Dormand-Prince 系数
         self.a = [
             [],
             [1/5],
@@ -284,13 +284,13 @@ class AdaptiveRK45Solver:
             [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84],
         ]
         
-        # 5th order weights
+        # 五阶权重
         self.b5 = [35/384, 0, 500/1113, 125/192, -2187/6784, 11/84, 0]
         
-        # 4th order weights
+        # 四阶权重
         self.b4 = [5179/57600, 0, 7571/16695, 393/640, -92097/339200, 187/2100, 1/40]
         
-        # Time fractions
+        # 时间分数
         self.c = [0, 1/5, 3/10, 4/5, 8/9, 1, 1]
     
     def solve(
@@ -299,30 +299,30 @@ class AdaptiveRK45Solver:
         x_0: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Solve ODE using adaptive RK45.
+        使用自适应 RK45 求解 ODE
         
-        Args:
-            velocity_fn: Function v(x, t) returning velocity
-            x_0: Initial state
+        参数:
+            velocity_fn: 函数 v(x, t)，返回速度
+            x_0: 初始状态
             
-        Returns:
-            Final state at t=1
+        返回:
+            t=1 处的最终状态
         """
         x = x_0.clone()
         B = x_0.shape[0]
         t = torch.full((B,), self.config.t_start, device=x_0.device, dtype=x_0.dtype)
         
-        # Initial step size
+        # 初始步长
         dt = (self.config.t_end - self.config.t_start) / self.config.num_steps
         
         trajectory = [x.clone()] if self.config.return_trajectory else None
         
         step_count = 0
         while t[0] < self.config.t_end and step_count < self.config.max_steps:
-            # Don't overshoot
+            # 不要超出范围
             dt = min(dt, self.config.t_end - t[0].item())
             
-            # Compute RK stages
+            # 计算 RK 阶段
             k = []
             k.append(velocity_fn(x, t))
             
@@ -333,21 +333,21 @@ class AdaptiveRK45Solver:
                 t_stage = t + self.c[i] * dt
                 k.append(velocity_fn(x_stage, t_stage))
             
-            # Compute 4th and 5th order solutions
+            # 计算四阶和五阶解
             x5 = x.clone()
             x4 = x.clone()
             for i in range(7):
                 x5 = x5 + dt * self.b5[i] * k[i]
                 x4 = x4 + dt * self.b4[i] * k[i]
             
-            # Error estimation
+            # 误差估计
             error = (x5 - x4).abs().max()
             
-            # Tolerance check
+            # 容差检查
             tol = self.config.atol + self.config.rtol * x.abs().max()
             
             if error < tol:
-                # Accept step
+                # 接受步骤
                 x = x5
                 t = t + dt
                 step_count += 1
@@ -355,13 +355,13 @@ class AdaptiveRK45Solver:
                 if trajectory is not None:
                     trajectory.append(x.clone())
             
-            # Adjust step size
+            # 调整步长
             if error > 0:
                 dt = 0.9 * dt * (tol / error) ** 0.2
             else:
                 dt = 2 * dt
             
-            dt = max(dt, 1e-6)  # Minimum step size
+            dt = max(dt, 1e-6)  # 最小步长
         
         if self.config.return_trajectory:
             return torch.stack(trajectory, dim=1)
@@ -371,11 +371,11 @@ class AdaptiveRK45Solver:
 
 class MidpointSolver:
     """
-    Midpoint method (2nd order) ODE solver.
+    中点方法（二阶）ODE 求解器
     
-    Better than Euler, simpler than RK4.
+    比欧拉方法更好，比 RK4 更简单。
     
-    Update rule:
+    更新规则:
         k1 = v(x_n, t_n)
         x_{n+1} = x_n + dt * v(x_n + dt/2 * k1, t_n + dt/2)
     """
@@ -389,7 +389,7 @@ class MidpointSolver:
         x_0: torch.Tensor,
         num_steps: int = None,
     ) -> torch.Tensor:
-        """Solve ODE using midpoint method."""
+        """使用中点方法求解 ODE"""
         num_steps = num_steps or self.config.num_steps
         dt = (self.config.t_end - self.config.t_start) / num_steps
         
@@ -420,14 +420,14 @@ def create_solver(
     config: SolverConfig = None,
 ):
     """
-    Factory function to create ODE solvers.
+    创建 ODE 求解器的工厂函数
     
-    Args:
-        solver_type: Type of solver ("euler", "midpoint", "rk4", "rk45")
-        config: Solver configuration
+    参数:
+        solver_type: 求解器类型 ("euler", "midpoint", "rk4", "rk45")
+        config: 求解器配置
         
-    Returns:
-        ODE solver instance
+    返回:
+        ODE 求解器实例
     """
     solvers = {
         "euler": EulerSolver,

@@ -1,5 +1,5 @@
 """
-Interface Definitions for CFM FlowMP
+CFM FlowMP 接口定义
 
 定义项目中所有核心类和工具函数的抽象接口。
 这个文件作为接口规范，保证各模块API的一致性和可重复使用性。
@@ -96,7 +96,6 @@ class ODESolver(ABC):
         self,
         velocity_fn,
         x_0: torch.Tensor,
-        t_span: List[float],
         **kwargs
     ) -> torch.Tensor:
         """
@@ -104,12 +103,11 @@ class ODESolver(ABC):
         
         Args:
             velocity_fn: 速度函数 velocity_fn(x_t, t) -> dx_t
-            x_0: 初始条件 [B, T, D]
-            t_span: 时间点列表
-            **kwargs: 求解器特定参数
+            x_0: 初始条件 [B, T, D] 或 [B, D]
+            **kwargs: 求解器特定参数（如 num_steps, time_schedule 等）
         
         Returns:
-            最终状态 x_T [B, T, D]
+            最终状态 x_1 [B, T, D] 或轨迹（如果 return_trajectory=True）
         """
         pass
     

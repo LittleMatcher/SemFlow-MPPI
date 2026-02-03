@@ -1,12 +1,12 @@
 """
-Flow Matching Training Logic
+流匹配训练逻辑
 
-Implements the core flow matching algorithm for trajectory generation:
-1. Interpolation path construction (Eq. 6, 8, 10 from FlowMP)
-2. Target field computation
-3. Flow matching loss
+实现用于轨迹生成的核心流匹配算法：
+1. 插值路径构建（FlowMP 的公式 6, 8, 10）
+2. 目标场计算
+3. 流匹配损失
 
-Reference: FlowMP paper equations for conditional probability paths.
+参考: FlowMP 论文中条件概率路径的公式。
 """
 
 import torch
@@ -18,52 +18,52 @@ from dataclasses import dataclass
 
 @dataclass
 class FlowMatchingConfig:
-    """Configuration for flow matching training."""
+    """流匹配训练配置"""
     
-    # State dimensions
-    state_dim: int = 2  # Position dimension (x, y)
+    # 状态维度
+    state_dim: int = 2  # 位置维度 (x, y)
     
-    # Loss weights
-    lambda_vel: float = 1.0      # Weight for velocity field loss
-    lambda_acc: float = 1.0      # Weight for acceleration field loss
-    lambda_jerk: float = 1.0     # Weight for jerk field loss
+    # 损失权重
+    lambda_vel: float = 1.0      # 速度场损失的权重
+    lambda_acc: float = 1.0      # 加速度场损失的权重
+    lambda_jerk: float = 1.0     # 急动场损失的权重
     
-    # Interpolation parameters
-    sigma_min: float = 1e-4      # Minimum noise scale at t=1
+    # 插值参数
+    sigma_min: float = 1e-4      # t=1 处的最小噪声尺度
     
-    # Optional: different sigma for each state component
-    sigma_pos: float = 1e-4      # Noise scale for position
-    sigma_vel: float = 1e-4      # Noise scale for velocity
-    sigma_acc: float = 1e-4      # Noise scale for acceleration
+    # 可选: 每个状态分量的不同 sigma
+    sigma_pos: float = 1e-4      # 位置的噪声尺度
+    sigma_vel: float = 1e-4      # 速度的噪声尺度
+    sigma_acc: float = 1e-4      # 加速度的噪声尺度
     
-    # Time sampling
-    t_min: float = 0.0           # Minimum flow time
-    t_max: float = 1.0           # Maximum flow time
+    # 时间采样
+    t_min: float = 0.0           # 最小流时间
+    t_max: float = 1.0           # 最大流时间
     
 
 class FlowInterpolator:
     """
-    Constructs interpolation paths for flow matching.
+    构建流匹配的插值路径
     
-    Implements the conditional probability path p_t(x|x_1) used in
-    Conditional Flow Matching. At t=0, the distribution is N(0, I),
-    and at t=1, the distribution concentrates at the target x_1.
+    实现条件流匹配中使用的条件概率路径 p_t(x|x_1)。
+    在 t=0 时，分布为 N(0, I)，
+    在 t=1 时，分布集中在目标 x_1 处。
     
-    The interpolation follows:
+    插值遵循:
         x_t = t * x_1 + (1 - t) * epsilon
         
-    where epsilon ~ N(0, I) and x_1 is the target trajectory.
+    其中 epsilon ~ N(0, I)，x_1 是目标轨迹。
     
-    For FlowMP, we have three coupled interpolations:
-        q_t = interpolate(q_0, q_1, t)     # position
-        q_dot_t = interpolate(q_dot_0, q_dot_1, t)    # velocity
-        q_ddot_t = interpolate(q_ddot_0, q_ddot_1, t)  # acceleration
+    对于 FlowMP，我们有三个耦合的插值:
+        q_t = interpolate(q_0, q_1, t)     # 位置
+        q_dot_t = interpolate(q_dot_0, q_dot_1, t)    # 速度
+        q_ddot_t = interpolate(q_ddot_0, q_ddot_1, t)  # 加速度
     """
     
     def __init__(self, config: FlowMatchingConfig = None):
         """
-        Args:
-            config: Flow matching configuration
+        参数:
+            config: 流匹配配置
         """
         self.config = config or FlowMatchingConfig()
     
@@ -74,15 +74,15 @@ class FlowInterpolator:
         dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         """
-        Sample flow time t uniformly from [t_min, t_max].
+        从 [t_min, t_max] 均匀采样流时间 t
         
-        Args:
-            batch_size: Number of samples
-            device: Target device
-            dtype: Target dtype
+        参数:
+            batch_size: 样本数
+            device: 目标设备
+            dtype: 目标数据类型
             
-        Returns:
-            Time values of shape [batch_size]
+        返回:
+            形状为 [batch_size] 的时间值
         """
         t = torch.rand(batch_size, device=device, dtype=dtype)
         t = self.config.t_min + t * (self.config.t_max - self.config.t_min)
@@ -95,15 +95,15 @@ class FlowInterpolator:
         dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         """
-        Sample Gaussian noise epsilon ~ N(0, I).
+        采样高斯噪声 epsilon ~ N(0, I)
         
-        Args:
-            target_shape: Shape of noise tensor
-            device: Target device
-            dtype: Target dtype
+        参数:
+            target_shape: 噪声张量的形状
+            device: 目标设备
+            dtype: 目标数据类型
             
-        Returns:
-            Noise tensor of given shape
+        返回:
+            给定形状的噪声张量
         """
         return torch.randn(target_shape, device=device, dtype=dtype)
     
@@ -114,20 +114,19 @@ class FlowInterpolator:
         t: torch.Tensor,    # Time
     ) -> torch.Tensor:
         """
-        Simple linear interpolation: x_t = t * x_1 + (1 - t) * x_0
+        简单线性插值: x_t = t * x_1 + (1 - t) * x_0
         
-        This is the standard OT (Optimal Transport) path used in
-        rectified flow / flow matching.
+        这是修正流/流匹配中使用的标准 OT（最优传输）路径
         
-        Args:
-            x_0: Initial state (noise), shape [B, ...]
-            x_1: Target state, shape [B, ...]
-            t: Time values, shape [B] or [B, 1, ...]
+        参数:
+            x_0: 初始状态（噪声），形状 [B, ...]
+            x_1: 目标状态，形状 [B, ...]
+            t: 时间值，形状 [B] 或 [B, 1, ...]
             
-        Returns:
-            Interpolated state x_t
+        返回:
+            插值状态 x_t
         """
-        # Expand t for broadcasting
+        # 扩展 t 以进行广播
         while t.dim() < x_0.dim():
             t = t.unsqueeze(-1)
         
@@ -141,36 +140,36 @@ class FlowInterpolator:
         from_interpolated: bool = True,
     ) -> torch.Tensor:
         """
-        Compute the target velocity field.
+        计算目标速度场
         
-        For the OT path x_t = t * x_1 + (1-t) * x_0:
+        对于 OT 路径 x_t = t * x_1 + (1-t) * x_0:
             dx_t/dt = x_1 - x_0
         
-        Or equivalently, expressed in terms of x_t:
+        或者等价地，用 x_t 表示:
             v_target = (x_1 - x_t) / (1 - t)
         
-        Args:
-            x_0: Initial state (noise) or interpolated state
-            x_1: Target state
-            t: Time values
-            from_interpolated: If True, x_0 is actually x_t (interpolated)
+        参数:
+            x_0: 初始状态（噪声）或插值状态
+            x_1: 目标状态
+            t: 时间值
+            from_interpolated: 如果为 True，x_0 实际上是 x_t（插值后的）
             
-        Returns:
-            Target velocity field
+        返回:
+            目标速度场
         """
-        # Expand t for broadcasting
+        # 扩展 t 以进行广播
         while t.dim() < x_1.dim():
             t = t.unsqueeze(-1)
         
         if from_interpolated:
-            # x_0 is actually x_t
+            # x_0 实际上是 x_t
             x_t = x_0
             # v = (x_1 - x_t) / (1 - t)
-            # Add small epsilon to avoid division by zero at t=1
+            # 添加小的 epsilon 以避免在 t=1 时除以零
             eps = 1e-6
             v_target = (x_1 - x_t) / (1 - t + eps)
         else:
-            # Simple form: v = x_1 - x_0
+            # 简单形式: v = x_1 - x_0
             v_target = x_1 - x_0
         
         return v_target
@@ -186,42 +185,41 @@ class FlowInterpolator:
         epsilon_q_ddot: torch.Tensor = None, # Acceleration noise
     ) -> Dict[str, torch.Tensor]:
         """
-        Construct interpolated trajectory state at flow time t.
+        在流时间 t 处构建插值轨迹状态
         
-        Implements the FlowMP interpolation for position, velocity,
-        and acceleration simultaneously (Eq. 6, 8, 10).
+        同时实现位置、速度和加速度的 FlowMP 插值（公式 6, 8, 10）
         
-        The interpolation follows the optimal transport path:
+        插值遵循最优传输路径:
             x_t = t * x_1 + (1 - t) * epsilon
         
-        And the target velocity field is:
+        目标速度场为:
             u_target = (x_1 - x_t) / (1 - t)
         
-        Note: For t close to 1, we use numerical stabilization.
+        注意: 对于接近 1 的 t，我们使用数值稳定化
         
-        Args:
-            q_1: Target position trajectory [B, T, state_dim]
-            q_dot_1: Target velocity trajectory [B, T, state_dim]
-            q_ddot_1: Target acceleration trajectory [B, T, state_dim]
-            t: Flow time values [B]
-            epsilon_*: Optional pre-sampled noise tensors
+        参数:
+            q_1: 目标位置轨迹 [B, T, state_dim]
+            q_dot_1: 目标速度轨迹 [B, T, state_dim]
+            q_ddot_1: 目标加速度轨迹 [B, T, state_dim]
+            t: 流时间值 [B]
+            epsilon_*: 可选的预采样噪声张量
             
-        Returns:
-            Dictionary containing:
-                - 'q_t': Interpolated position [B, T, state_dim]
-                - 'q_dot_t': Interpolated velocity [B, T, state_dim]
-                - 'q_ddot_t': Interpolated acceleration [B, T, state_dim]
-                - 'u_target': Position velocity field target [B, T, state_dim]
-                - 'v_target': Velocity acceleration field target [B, T, state_dim]
-                - 'w_target': Acceleration jerk field target [B, T, state_dim]
-                - 'x_t': Concatenated state [B, T, state_dim * 3]
-                - 'target': Concatenated target field [B, T, state_dim * 3]
+        返回:
+            包含以下内容的字典:
+                - 'q_t': 插值位置 [B, T, state_dim]
+                - 'q_dot_t': 插值速度 [B, T, state_dim]
+                - 'q_ddot_t': 插值加速度 [B, T, state_dim]
+                - 'u_target': 位置速度场目标 [B, T, state_dim]
+                - 'v_target': 速度加速度场目标 [B, T, state_dim]
+                - 'w_target': 加速度急动场目标 [B, T, state_dim]
+                - 'x_t': 拼接状态 [B, T, state_dim * 3]
+                - 'target': 拼接目标场 [B, T, state_dim * 3]
         """
         B, T, D = q_1.shape
         device = q_1.device
         dtype = q_1.dtype
         
-        # Sample noise if not provided
+        # 如果未提供则采样噪声
         if epsilon_q is None:
             epsilon_q = self.sample_noise((B, T, D), device, dtype)
         if epsilon_q_dot is None:
@@ -229,10 +227,10 @@ class FlowInterpolator:
         if epsilon_q_ddot is None:
             epsilon_q_ddot = self.sample_noise((B, T, D), device, dtype)
         
-        # Expand t for broadcasting: [B] -> [B, 1, 1]
+        # 扩展 t 以进行广播: [B] -> [B, 1, 1]
         t_expanded = t[:, None, None]
         
-        # ============ Interpolate States (Eq. 6, 8, 10) ============
+        # ============ 插值状态（公式 6, 8, 10）============
         # q_t = t * q_1 + (1 - t) * epsilon_q
         q_t = t_expanded * q_1 + (1 - t_expanded) * epsilon_q
         
@@ -242,17 +240,17 @@ class FlowInterpolator:
         # q_ddot_t = t * q_ddot_1 + (1 - t) * epsilon_q_ddot
         q_ddot_t = t_expanded * q_ddot_1 + (1 - t_expanded) * epsilon_q_ddot
         
-        # ============ Compute Target Fields ============
-        # According to FlowMP Algorithm 1:
+        # ============ 计算目标场 ============
+        # 根据 FlowMP 算法 1:
         # u_target = (q_1 - q_t) / (1 - t)
         # v_target = (q_dot_1 - q_dot_t) / (1 - t)
         # w_target = (q_ddot_1 - q_ddot_t) / (1 - t)
         #
-        # Note: Since q_t = t * q_1 + (1-t) * epsilon,
+        # 注意: 由于 q_t = t * q_1 + (1-t) * epsilon,
         #       (q_1 - q_t) / (1-t) = q_1 - epsilon
-        # We use the explicit (x_1 - x_t) / (1-t) form for consistency.
+        # 我们使用显式 (x_1 - x_t) / (1-t) 形式以保持一致性
         
-        # Small epsilon to avoid division by zero when t is close to 1
+        # 小的 epsilon 以避免在 t 接近 1 时除以零
         eps = 1e-6
         one_minus_t = (1 - t_expanded).clamp(min=eps)
         
@@ -260,11 +258,11 @@ class FlowInterpolator:
         v_target = (q_dot_1 - q_dot_t) / one_minus_t
         w_target = (q_ddot_1 - q_ddot_t) / one_minus_t
         
-        # ============ Concatenate for Network Input/Output ============
-        # Input state: [pos, vel, acc] -> [B, T, 6]
+        # ============ 为网络输入/输出拼接 ============
+        # 输入状态: [位置, 速度, 加速度] -> [B, T, 6]
         x_t = torch.cat([q_t, q_dot_t, q_ddot_t], dim=-1)
         
-        # Target field: [u, v, w] -> [B, T, 6]
+        # 目标场: [u, v, w] -> [B, T, 6]
         target = torch.cat([u_target, v_target, w_target], dim=-1)
         
         return {
@@ -285,24 +283,24 @@ class FlowInterpolator:
 
 class FlowMatchingLoss(nn.Module):
     """
-    Flow Matching Loss for FlowMP.
+    FlowMP 的流匹配损失
     
-    Computes the weighted MSE loss between predicted and target vector fields:
+    计算预测和目标向量场之间的加权 MSE 损失:
     
     L = ||u_pred - u_target||^2 
         + λ_acc * ||v_pred - v_target||^2 
         + λ_jerk * ||w_pred - w_target||^2
     
-    where:
-        - u: velocity field (for position)
-        - v: acceleration field (for velocity)
-        - w: jerk field (for acceleration)
+    其中:
+        - u: 速度场（用于位置）
+        - v: 加速度场（用于速度）
+        - w: 急动场（用于加速度）
     """
     
     def __init__(self, config: FlowMatchingConfig = None):
         """
-        Args:
-            config: Flow matching configuration with loss weights
+        参数:
+            config: 带有损失权重的流匹配配置
         """
         super().__init__()
         self.config = config or FlowMatchingConfig()
@@ -315,23 +313,23 @@ class FlowMatchingLoss(nn.Module):
         reduction: str = 'mean',
     ) -> Dict[str, torch.Tensor]:
         """
-        Compute flow matching loss.
+        计算流匹配损失
         
-        Args:
-            model_output: Predicted vector field [B, T, 6]
-            target: Target vector field [B, T, 6]
-            reduction: Loss reduction method ('mean', 'sum', 'none')
+        参数:
+            model_output: 预测的向量场 [B, T, 6]
+            target: 目标向量场 [B, T, 6]
+            reduction: 损失归约方法 ('mean', 'sum', 'none')
             
-        Returns:
-            Dictionary containing:
-                - 'loss': Total weighted loss
-                - 'loss_vel': Velocity field loss (u)
-                - 'loss_acc': Acceleration field loss (v)
-                - 'loss_jerk': Jerk field loss (w)
+        返回:
+            包含以下内容的字典:
+                - 'loss': 总加权损失
+                - 'loss_vel': 速度场损失 (u)
+                - 'loss_acc': 加速度场损失 (v)
+                - 'loss_jerk': 急动场损失 (w)
         """
         D = self.config.state_dim
         
-        # Extract field components
+        # 提取场分量
         u_pred = model_output[..., :D]
         v_pred = model_output[..., D:D*2]
         w_pred = model_output[..., D*2:D*3]
@@ -340,12 +338,12 @@ class FlowMatchingLoss(nn.Module):
         v_target = target[..., D:D*2]
         w_target = target[..., D*2:D*3]
         
-        # Compute MSE for each field
+        # 计算每个场的 MSE
         loss_vel = F.mse_loss(u_pred, u_target, reduction=reduction)
         loss_acc = F.mse_loss(v_pred, v_target, reduction=reduction)
         loss_jerk = F.mse_loss(w_pred, w_target, reduction=reduction)
         
-        # Weighted sum
+        # 加权和
         total_loss = (
             self.config.lambda_vel * loss_vel +
             self.config.lambda_acc * loss_acc +
@@ -371,38 +369,38 @@ class FlowMatchingLoss(nn.Module):
         t: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        Complete training loss computation including interpolation.
+        完整的训练损失计算，包括插值
         
-        This method handles the full training pipeline:
-        1. Sample flow time t
-        2. Sample noise
-        3. Construct interpolated states
-        4. Compute target fields
-        5. Run model forward pass
-        6. Compute loss
+        此方法处理完整的训练流程:
+        1. 采样流时间 t
+        2. 采样噪声
+        3. 构建插值状态
+        4. 计算目标场
+        5. 运行模型前向传播
+        6. 计算损失
         
-        Args:
-            model: FlowMP transformer model
-            q_1: Target position trajectory [B, T, D]
-            q_dot_1: Target velocity trajectory [B, T, D]
-            q_ddot_1: Target acceleration trajectory [B, T, D]
-            start_pos: Starting position [B, D]
-            goal_pos: Goal position [B, D]
-            start_vel: Starting velocity [B, D] (optional)
-            t: Pre-sampled time (optional, will sample if None)
+        参数:
+            model: FlowMP transformer 模型
+            q_1: 目标位置轨迹 [B, T, D]
+            q_dot_1: 目标速度轨迹 [B, T, D]
+            q_ddot_1: 目标加速度轨迹 [B, T, D]
+            start_pos: 起始位置 [B, D]
+            goal_pos: 目标位置 [B, D]
+            start_vel: 起始速度 [B, D] (可选)
+            t: 预采样时间 (可选，如果为 None 则采样)
             
-        Returns:
-            Loss dictionary
+        返回:
+            损失字典
         """
         B = q_1.shape[0]
         device = q_1.device
         dtype = q_1.dtype
         
-        # Sample flow time if not provided
+        # 如果未提供则采样流时间
         if t is None:
             t = self.interpolator.sample_time(B, device, dtype)
         
-        # Construct interpolated trajectory and targets
+        # 构建插值轨迹和目标
         interp_result = self.interpolator.interpolate_trajectory(
             q_1=q_1,
             q_dot_1=q_dot_1,
@@ -413,7 +411,7 @@ class FlowMatchingLoss(nn.Module):
         x_t = interp_result['x_t']
         target = interp_result['target']
         
-        # Model forward pass
+        # 模型前向传播
         model_output = model(
             x_t=x_t,
             t=t,
@@ -422,10 +420,10 @@ class FlowMatchingLoss(nn.Module):
             start_vel=start_vel,
         )
         
-        # Compute loss
+        # 计算损失
         loss_dict = self.forward(model_output, target)
         
-        # Add interpolation info for debugging
+        # 添加插值信息用于调试
         loss_dict['t'] = t.mean()
         
         return loss_dict
@@ -433,10 +431,9 @@ class FlowMatchingLoss(nn.Module):
 
 class VelocityConsistencyLoss(nn.Module):
     """
-    Optional auxiliary loss for physical consistency.
+    用于物理一致性的可选辅助损失
     
-    Encourages the velocity field to be consistent with
-    the time derivative of the position field.
+    鼓励速度场与位置场的时间导数保持一致
     """
     
     def __init__(self, weight: float = 0.1):
@@ -450,20 +447,20 @@ class VelocityConsistencyLoss(nn.Module):
         dt: float = 0.1,
     ) -> torch.Tensor:
         """
-        Compute velocity consistency loss.
+        计算速度一致性损失
         
-        Args:
-            q_pred: Predicted positions [B, T, D]
-            q_dot_pred: Predicted velocities [B, T, D]
-            dt: Time step between trajectory points
+        参数:
+            q_pred: 预测位置 [B, T, D]
+            q_dot_pred: 预测速度 [B, T, D]
+            dt: 轨迹点之间的时间步长
             
-        Returns:
-            Consistency loss scalar
+        返回:
+            一致性损失标量
         """
-        # Finite difference velocity: dq/dt ≈ (q[t+1] - q[t]) / dt
+        # 有限差分速度: dq/dt ≈ (q[t+1] - q[t]) / dt
         q_diff = (q_pred[:, 1:, :] - q_pred[:, :-1, :]) / dt
         
-        # Compare with predicted velocity (excluding last step)
+        # 与预测速度比较（排除最后一步）
         q_dot_mid = (q_dot_pred[:, 1:, :] + q_dot_pred[:, :-1, :]) / 2
         
         loss = F.mse_loss(q_diff, q_dot_mid)
