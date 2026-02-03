@@ -80,124 +80,10 @@ python train.py --synthetic --trajectory_type polynomial --epochs 100
 python train.py --synthetic --trajectory_type sine --epochs 100
 ```
 
-### Training with Custom Data
-
-```bash
-# Train with your own trajectory data
-python train.py --data_path /path/to/trajectories.npz --epochs 100
-
-# With custom model configuration
-python train.py \
-    --data_path /path/to/data.npz \
-    --model_variant large \
-    --hidden_dim 512 \
-    --num_layers 8 \
-    --lr 5e-5 \
-    --batch_size 32
-```
-
-### Generating Trajectories
-
-```bash
-# Generate a single trajectory
-python inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --start 0,0 \
-    --goal 2,2 \
-    --visualize
-
-# Generate multiple samples
-python inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --start 0,0 \
-    --goal 2,2 \
-    --num_samples 10 \
-    --output generated_trajectories.npz
-
-# With custom ODE solver settings
-python inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --start 0,0 \
-    --goal 2,2 \
-    --solver rk4 \
-    --num_steps 50
-```
-
-## API Usage
-
-### Training
-
-```python
-import torch
-from cfm_flowmp.models import create_flowmp_transformer
-from cfm_flowmp.training import CFMTrainer, TrainerConfig, FlowMatchingConfig
-from cfm_flowmp.data import SyntheticTrajectoryDataset, create_dataloader
-
-# Create model
-model = create_flowmp_transformer(
-    variant="base",
-    state_dim=2,
-    max_seq_len=64,
-)
-
-# Create dataset
-dataset = SyntheticTrajectoryDataset(
-    num_trajectories=5000,
-    seq_len=64,
-    trajectory_type="bezier",
-)
-
-train_loader = create_dataloader(dataset, batch_size=64)
-
-# Setup training
-config = TrainerConfig(
-    num_epochs=100,
-    learning_rate=1e-4,
-    device="cuda",
-)
-
-trainer = CFMTrainer(model, config, train_loader)
-trainer.train()
-```
-
-### Inference
-
-```python
-import torch
-from cfm_flowmp.models import create_flowmp_transformer
-from cfm_flowmp.inference import TrajectoryGenerator, GeneratorConfig
-
-# Load trained model
-model = create_flowmp_transformer(variant="base")
-checkpoint = torch.load("checkpoints/best_model.pt")
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-
-# Create generator
-gen_config = GeneratorConfig(
-    solver_type="rk4",
-    num_steps=20,
-    use_bspline_smoothing=True,
-)
-generator = TrajectoryGenerator(model, gen_config)
-
-# Generate trajectories
-start_pos = torch.tensor([[0.0, 0.0]])
-goal_pos = torch.tensor([[2.0, 2.0]])
-
-result = generator.generate(
-    start_pos=start_pos,
-    goal_pos=goal_pos,
-    num_samples=5,
-)
-
-positions = result['positions']  # [5, 64, 2]
-velocities = result['velocities']  # [5, 64, 2]
-```
 
 ## Algorithm Details
 
-### Flow Matching Training (Algorithm 1)
+### Flow Matching Training 
 
 For each training step:
 
@@ -238,14 +124,133 @@ Following "Unified Generation-Refinement Planning", we use a non-uniform time sc
 4. **Extract** trajectory: $x_1 = (q_{\text{gen}}, \dot{q}_{\text{gen}}, \ddot{q}_{\text{gen}})$
 5. **Smooth** with B-splines to eliminate numerical drift
 
-## Model Architecture
+## System Architecture
 
-Based on "Unified Generation-Refinement Planning" and FlowMP official implementation.
+SemFlow-MPPI是一个三层分层架构，融合语义理解、流匹配轨迹生成和优化控制：
 
 ```
-Input: x_t [B, T, 6] (position, velocity, acceleration)
-       t [B] (flow time ∈ [0,1])
-       c (start_pos, goal_pos, start_vel)
+                     ┌─────────────────────────┐
+                     │   L3: Vision Language   │
+                     │   Model (VLM)           │
+                     │  ┌─────────────────┐    │
+                     │  │ Semantic Scene  │    │
+                     │  │ Understanding   │    │
+                     │  └────────┬────────┘    │
+                     │           │ Cost Map    │
+                     └───────────┼──────────────┘
+                                 │
+                    ┌────────────▼───────────────┐
+                    │   L2: Safety-Embedded     │
+                    │   Conditional Flow       │
+                    │   Matching (CFM)         │
+                    │  ┌──────────────────┐    │
+                    │  │ Multi-Modal      │    │
+                    │  │ Anchor Selection │    │
+                    │  │ (K-Means)        │    │
+                    │  ├──────────────────┤    │
+                    │  │ CBF Constraints  │    │
+                    │  │ Safety Guidance  │    │
+                    │  └────────┬─────────┘    │
+                    │           │ Trajectory  │
+                    │           │ Anchors     │
+                    └───────────┼──────────────┘
+                                │
+                    ┌───────────▼───────────────┐
+                    │   L1: Model Predictive   │
+                    │   Path Integral Control  │
+                    │   (MPPI)                 │
+                    │  ┌──────────────────┐    │
+                    │  │ Stochastic Opt   │    │
+                    │  │ Real-Time Local  │    │
+                    │  │ Refinement       │    │
+                    │  └────────┬─────────┘    │
+                    │           │ Final       │
+                    │           │ Trajectory │
+                    └───────────┼──────────────┘
+                                │
+                                ▼
+                        ┌──────────────────┐
+                        │  Robot Control   │
+                        │  Module          │
+                        └──────────────────┘
+```
+
+### Layer Functions
+
+- **L3 (VLM)**: 解析场景语义，生成代价图 (cost map)
+- **L2 (CFM)**: 生成多条候选轨迹锚点，融合安全约束 (CBF)
+- **L1 (MPPI)**: 在锚点基础上进行实时随机优化，输出最优执行轨迹
+
+## Model Architecture
+
+### L2 CFM with CBF Safety Constraints
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│          L2 Safety-Embedded Flow Matching Layer              │
+└──────────────────────────────────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+        ▼                   ▼                   ▼
+    ┌───────┐         ┌──────────┐        ┌──────────┐
+    │ Cost  │         │ CFM Flow │        │ Start/  │
+    │ Map   │         │ Matching │        │ Goal    │
+    │Encoder│         │ Network  │        │Position │
+    └───┬───┘         └────┬─────┘        └────┬────┘
+        │                  │                    │
+        └──────────────────┼────────────────────┘
+                           │
+                    ┌──────▼──────┐
+                    │  Sample N   │
+                    │  Trajectories
+                    │  (Noisy z)  │
+                    └──────┬──────┘
+                           │
+        ┌──────────────────┴──────────────────┐
+        │                                     │
+        ▼                                     ▼
+┌──────────────────┐              ┌──────────────────────┐
+│  CBF Guidance    │              │  Multi-Modal Anchor  │
+│  Module          │              │  Selector (K-Means) │
+│  ┌────────────┐  │              │  ┌────────────────┐ │
+│  │ Barrier    │  │              │  │ Clustering     │ │
+│  │ Function   │  │              │  │ Features Ext.  │ │
+│  │ h(x)       │  │              │  └────────────────┘ │
+│  ├────────────┤  │              │  ┌────────────────┐ │
+│  │ Safety     │  │              │  │ Representative │ │
+│  │ Constraint │  │              │  │ Anchor Select  │ │
+│  │ Violation  │  │              │  └────────────────┘ │
+│  │ Check      │  │              └──────────────────────┘
+│  └────────────┘  │
+└────────┬─────────┘
+         │
+         └─────────┬──────────────┐
+                   │              │
+                   ▼              ▼
+            ┌────────────┐  ┌──────────────┐
+            │  Safety    │  │  Anchors     │
+            │  Modified  │  │  {τ_i}       │
+            │  Trajectory│  │  (Discrete)  │
+            └────────────┘  └──────────────┘
+                   │              │
+                   └──────┬───────┘
+                          │
+                   ┌──────▼──────────┐
+                   │  Output to L1   │
+                   │  MPPI Control   │
+                   └─────────────────┘
+```
+
+**CBF Mathematical Foundation** (安全约束):
+- Safety Set Invariance: `C_safe = {x | h(x) ≥ 0}`
+- Invariance Condition: `dh/dt + α·h(x) ≥ 0`
+- Violation Potential: `V_cbf = ReLU(-(dh/dt + α·h(x)))`
+- Vector Field Correction: `v̄ = v + λ·∇S_CBF(x)`
+
+### Transformer Vector Field Prediction
+
+Based on "Unified Generation-Refinement Planning" and FlowMP official implementation.
 
 ┌─────────────────────────────────────────┐
 │      Trajectory Tokenizer (Linear)      │
@@ -315,34 +320,6 @@ Input: x_t [B, T, 6] (position, velocity, acceleration)
 2. **Cross-Attention**: Trajectory tokens attend to condition tokens
 3. **Token Prepending**: Condition encoded as prefix tokens
 
-## Configuration
-
-### Model Variants
-
-| Variant | Hidden Dim | Layers | Heads | Params | Notes |
-|---------|-----------|--------|-------|--------|-------|
-| small   | 128       | 4      | 4     | ~3M    | Fast prototyping |
-| base    | 256       | 8      | 8     | ~15M   | Recommended (Mizuta et al.) |
-| large   | 512       | 12     | 16    | ~50M   | High capacity |
-
-### Key Hyperparameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| learning_rate | 1e-4 | Adam learning rate |
-| weight_decay | 0.01 | L2 regularization |
-| warmup_steps | 1000 | LR warmup steps |
-| lambda_acc | 1.0 | Acceleration loss weight |
-| lambda_jerk | 1.0 | Jerk loss weight |
-| condition_type | "adaln" | Condition injection method |
-
-### Inference Time Schedule
-
-| Schedule | Steps | Description |
-|----------|-------|-------------|
-| 8-step (default) | `[0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]` | Fast inference with refinement |
-| uniform-10 | 10 equally spaced | Standard uniform stepping |
-| uniform-20 | 20 equally spaced | Higher accuracy |
 
 ## Data Format
 
@@ -355,24 +332,6 @@ Input: x_t [B, T, 6] (position, velocity, acceleration)
     'accelerations': np.ndarray,  # [N, T, D] acceleration trajectories (optional)
 }
 ```
-
-If velocities/accelerations are not provided, they will be computed from positions using finite differences.
-
-### Supported File Formats
-
-- `.npy` - Single numpy array (positions only)
-- `.npz` - Numpy archive (multiple arrays)
-- `.h5`/`.hdf5` - HDF5 files
-- `.pkl` - Pickle files
-
-## References
-
-- **FlowMP**: [mkhangg/flow_mp](https://github.com/mkhangg/flow_mp) - Official FlowMP implementation
-- **Unified Generation-Refinement Planning**: Non-uniform ODE scheduling for efficient inference
-- **Conditional Flow Matching**: [Lipman et al., 2023](https://arxiv.org/abs/2210.02747)
-- **Rectified Flow**: [Liu et al., 2022](https://arxiv.org/abs/2209.03003)
-- **DiT (Diffusion Transformers)**: [Peebles & Xie, 2023](https://arxiv.org/abs/2212.09748)
-- **Mizuta et al.**: Transformer-based trajectory planning architecture guidelines
 
 ## License
 
