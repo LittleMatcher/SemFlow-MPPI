@@ -12,8 +12,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, Callable
 from dataclasses import dataclass
+import numpy as np
 
 
 @dataclass
@@ -39,6 +40,13 @@ class FlowMatchingConfig:
     # 时间采样
     t_min: float = 0.0           # 最小流时间
     t_max: float = 1.0           # 最大流时间
+    
+    # CBF 约束配置
+    use_cbf_constraint: bool = False
+    cbf_weight: float = 10.0     # CBF 损失权重
+    cbf_margin: float = 0.1      # 安全裕量 (R_safe)
+    cbf_alpha: float = 1.0       # CBF 类-K 函数参数 α
+    cbf_eps: float = 1e-6        # 数值稳定性
     
 
 class FlowInterpolator:
@@ -303,11 +311,20 @@ class FlowMatchingLoss(nn.Module):
         super().__init__()
         self.config = config or FlowMatchingConfig()
         self.interpolator = FlowInterpolator(config)
+        
+        # 初始化 CBF 约束模块
+        if self.config.use_cbf_constraint:
+            self.cbf_loss = CBFConstraintLoss(self.config)
+        else:
+            self.cbf_loss = None
     
     def forward(
         self,
         model_output: torch.Tensor,
         target: torch.Tensor,
+        trajectory: Optional[torch.Tensor] = None,
+        obstacle_positions: Optional[torch.Tensor] = None,
+        cost_map: Optional[torch.Tensor] = None,
         reduction: str = 'mean',
     ) -> Dict[str, torch.Tensor]:
         """
@@ -348,12 +365,40 @@ class FlowMatchingLoss(nn.Module):
             self.config.lambda_jerk * loss_jerk
         )
         
-        return {
+        result = {
             'loss': total_loss,
             'loss_vel': loss_vel,
             'loss_acc': loss_acc,
             'loss_jerk': loss_jerk,
         }
+        
+        # 添加 CBF 约束损失
+        if self.cbf_loss is not None and trajectory is not None:
+            # 从模型输出中提取速度场（前 D 个通道）
+            D = self.config.state_dim
+            predicted_velocities = model_output[..., :D]  # [B, T, D]
+            
+            cbf_result = self.cbf_loss(
+                trajectory=trajectory,
+                velocities=predicted_velocities,
+                obstacle_positions=obstacle_positions,
+                cost_map=cost_map,
+            )
+            
+            # 将 CBF 损失添加到总损失
+            total_loss = total_loss + cbf_result['cbf_loss']
+            
+            # 更新结果字典
+            result.update({
+                'loss': total_loss,
+                'cbf_loss': cbf_result['cbf_loss'],
+                'cbf_violation': cbf_result['cbf_violation'],
+                'violation_ratio': cbf_result['violation_ratio'],
+                'min_barrier_value': cbf_result['min_barrier_value'],
+                'mean_barrier_value': cbf_result['mean_barrier_value'],
+            })
+        
+        return result
     
     def compute_training_loss(
         self,
@@ -463,3 +508,249 @@ class VelocityConsistencyLoss(nn.Module):
         
         loss = F.mse_loss(q_diff, q_dot_mid)
         return self.weight * loss
+
+
+class CBFConstraintLoss(nn.Module):
+    """
+    控制障碍函数 (CBF) 约束损失
+    
+    实现安全集合不变性:
+    - 安全集: C_safe = {x | h(x) >= 0}
+    - 不变性条件: dh/dt + α*h(x) >= 0
+    - 违约势能: V_cbf = ReLU(-(dh/dt + α*h))
+    """
+    
+    def __init__(self, config: FlowMatchingConfig):
+        super().__init__()
+        self.config = config
+        self.cbf_weight = config.cbf_weight
+        self.cbf_margin = config.cbf_margin
+        self.cbf_alpha = config.cbf_alpha
+        self.eps = config.cbf_eps
+    
+    def compute_barrier_function(
+        self, 
+        positions: torch.Tensor, 
+        obstacle_positions: Optional[torch.Tensor] = None,
+        cost_map: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        计算控制障碍函数 h(x)
+        
+        参数:
+            positions: 机器人位置 [B, T, D] 或 [B, D]
+            obstacle_positions: 障碍物位置 [N_obs, D] (可选)
+            cost_map: L3 语义代价图 [B, H, W] (可选)
+            
+        返回:
+            障碍函数值 h(x) [B, T] 或 [B,]
+        """
+        if cost_map is not None:
+            # 方案1: 基于 L3 语义代价图
+            # 将 cost_map 视为 -h(p) 的形式
+            B, H, W = cost_map.shape
+            
+            # 假设 positions 在 [-1, 1] 范围，映射到图像坐标
+            if positions.dim() == 3:  # [B, T, D]
+                B_pos, T, D = positions.shape
+                pos_flat = positions.reshape(B_pos * T, D)  # [B*T, D]
+            else:  # [B, D]
+                pos_flat = positions
+                T = 1
+            
+            # 归一化到 [-1, 1] 用于 grid_sample
+            grid = pos_flat.unsqueeze(0).unsqueeze(0)  # [1, 1, B*T, D]
+            
+            # 双线性插值采样代价值
+            sampled_costs = F.grid_sample(
+                cost_map.unsqueeze(1),  # [B, 1, H, W]
+                grid.expand(B, -1, -1, -1),  # [B, 1, B*T, D]
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=False
+            ).squeeze(1).squeeze(1)  # [B, B*T]
+            
+            # 取对角线元素 (每个 batch 对应自己的位置)
+            if B == pos_flat.shape[0] // T:
+                batch_indices = torch.arange(B, device=positions.device)
+                time_indices = torch.arange(T, device=positions.device)
+                
+                if T == 1:
+                    barrier_values = -sampled_costs[batch_indices, batch_indices]  # [B,]
+                else:
+                    # 重新组织索引
+                    barrier_values = -sampled_costs.diagonal().reshape(B, T)  # [B, T]
+            else:
+                barrier_values = -sampled_costs.mean(dim=0)  # 简化处理
+                
+        elif obstacle_positions is not None:
+            # 方案2: 基于障碍物位置的欧几里得距离
+            # h(x) = ||p - p_obs||^2 - R_safe^2
+            
+            if positions.dim() == 3:  # [B, T, D]
+                B, T, D = positions.shape
+                pos_expanded = positions.unsqueeze(-2)  # [B, T, 1, D]
+            else:  # [B, D]
+                pos_expanded = positions.unsqueeze(-2)  # [B, 1, D]
+                T = 1
+            
+            obs_expanded = obstacle_positions.unsqueeze(0).unsqueeze(0)  # [1, 1, N_obs, D]
+            
+            # 计算到所有障碍物的距离
+            distances_squared = ((pos_expanded - obs_expanded) ** 2).sum(dim=-1)  # [B, T, N_obs]
+            
+            # 取最近障碍物的距离
+            min_distances_squared = distances_squared.min(dim=-1)[0]  # [B, T]
+            
+            # 障碍函数: 距离平方 - 安全半径平方
+            barrier_values = min_distances_squared - self.cbf_margin ** 2
+            
+        else:
+            # 方案3: 默认边界约束 (假设在单位正方形内)
+            # h(x) = min(1-|p_x|, 1-|p_y|, ...)
+            if positions.dim() == 3:  # [B, T, D]
+                abs_positions = positions.abs()
+            else:
+                abs_positions = positions.abs()
+            
+            # 到边界的最小距离
+            barrier_values = (1.0 - abs_positions).min(dim=-1)[0]  # [B, T] 或 [B,]
+        
+        return barrier_values
+    
+    def forward(
+        self,
+        trajectory: torch.Tensor,
+        velocities: torch.Tensor,
+        obstacle_positions: Optional[torch.Tensor] = None,
+        cost_map: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        计算 CBF 约束损失
+        
+        参数:
+            trajectory: 预测轨迹 [B, T, D]
+            velocities: 预测速度 [B, T, D]
+            obstacle_positions: 障碍物位置 [N_obs, D] (可选)
+            cost_map: L3 语义代价图 [B, H, W] (可选)
+            
+        返回:
+            包含 CBF 损失的字典
+        """
+        B, T, D = trajectory.shape
+        device = trajectory.device
+        
+        # 计算障碍函数 h(x)
+        h_values = self.compute_barrier_function(
+            trajectory, obstacle_positions, cost_map
+        )  # [B, T]
+        
+        # 计算障碍函数的时间导数 dh/dt
+        # dh/dt = ∇h · v，其中 ∇h 是障碍函数的梯度
+        trajectory_detached = trajectory.detach().requires_grad_(True)
+        h_values_grad = self.compute_barrier_function(
+            trajectory_detached, obstacle_positions, cost_map
+        )
+        
+        # 计算梯度 ∇h
+        h_gradients = torch.autograd.grad(
+            outputs=h_values_grad.sum(),
+            inputs=trajectory_detached,
+            create_graph=True,
+            retain_graph=True,
+        )[0]  # [B, T, D]
+        
+        # 计算 dh/dt = ∇h · v
+        dh_dt = (h_gradients * velocities).sum(dim=-1)  # [B, T]
+        
+        # CBF 不变性条件: dh/dt + α*h >= 0
+        cbf_condition = dh_dt + self.cbf_alpha * h_values  # [B, T]
+        
+        # CBF 违约势能: V_cbf = ReLU(-(dh/dt + α*h))
+        cbf_violation = F.relu(-cbf_condition)  # [B, T]
+        
+        # 总 CBF 损失
+        cbf_loss = self.cbf_weight * cbf_violation.mean()
+        
+        # 统计信息
+        violation_ratio = (cbf_violation > self.eps).float().mean()
+        min_barrier_value = h_values.min()
+        mean_barrier_value = h_values.mean()
+        
+        return {
+            'cbf_loss': cbf_loss,
+            'cbf_violation': cbf_violation.mean(),
+            'violation_ratio': violation_ratio,
+            'min_barrier_value': min_barrier_value,
+            'mean_barrier_value': mean_barrier_value,
+            'barrier_values': h_values.detach(),
+            'cbf_gradients': h_gradients.detach(),
+        }
+
+
+def compute_cbf_guidance(
+    positions: torch.Tensor,
+    velocities: torch.Tensor,
+    config: FlowMatchingConfig,
+    obstacle_positions: Optional[torch.Tensor] = None,
+    cost_map: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    计算 CBF 引导向量场修正项
+    
+    用于在 ODE 求解过程中实时修正向量场，确保安全性。
+    修正后的向量场: v̄ = v + λ * ∇S_CBF(x)
+    
+    参数:
+        positions: 当前位置 [B, T, D] 或 [B, D]
+        velocities: 当前速度 [B, T, D] 或 [B, D]
+        config: 流匹配配置
+        obstacle_positions: 障碍物位置 [N_obs, D]
+        cost_map: L3 语义代价图 [B, H, W]
+        
+    返回:
+        CBF 引导修正项 [B, T, D] 或 [B, D]
+    """
+    if not config.use_cbf_constraint:
+        return torch.zeros_like(velocities)
+    
+    # 创建临时 CBF 损失模块
+    cbf_loss = CBFConstraintLoss(config)
+    
+    # 计算 CBF 相关量
+    if positions.dim() == 2:  # [B, D] -> [B, 1, D]
+        positions = positions.unsqueeze(1)
+        velocities = velocities.unsqueeze(1)
+        squeeze_output = True
+    else:
+        squeeze_output = False
+    
+    # 计算障碍函数梯度
+    positions_grad = positions.detach().requires_grad_(True)
+    h_values = cbf_loss.compute_barrier_function(
+        positions_grad, obstacle_positions, cost_map
+    )
+    
+    h_gradients = torch.autograd.grad(
+        outputs=h_values.sum(),
+        inputs=positions_grad,
+        create_graph=False,
+        retain_graph=False,
+    )[0]  # [B, T, D]
+    
+    # 计算 CBF 条件违约
+    dh_dt = (h_gradients * velocities).sum(dim=-1, keepdim=True)  # [B, T, 1]
+    cbf_condition = dh_dt + config.cbf_alpha * h_values.unsqueeze(-1)  # [B, T, 1]
+    
+    # 只有违约时才施加修正力
+    violation_mask = (cbf_condition < 0).float()  # [B, T, 1]
+    
+    # CBF 修正向量: 指向安全区域的方向
+    # 修正强度与违约程度成正比
+    correction_strength = config.cbf_weight * violation_mask * F.relu(-cbf_condition)
+    cbf_correction = correction_strength * h_gradients  # [B, T, D]
+    
+    if squeeze_output:
+        cbf_correction = cbf_correction.squeeze(1)  # [B, D]
+    
+    return cbf_correction

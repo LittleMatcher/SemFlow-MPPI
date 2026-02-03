@@ -65,6 +65,13 @@ class L2Config:
     # Safety constraints (CBF embedding)
     use_cbf_constraint: bool = True
     cbf_margin: float = 0.1  # Safety margin in meters
+    enable_cbf_guidance: bool = True  # Enable CBF guidance in ODE solver
+    cbf_guidance_strength: float = 1.0  # CBF guidance strength lambda
+    
+    # Multi-modal anchor selection
+    enable_multimodal_anchors: bool = True
+    num_anchor_clusters: int = 4  # K clusters for anchor selection
+    multimodal_clustering_method: str = "kmeans"  # "kmeans", "gmm", or "spatial"
     
     # Trajectory smoothing
     use_bspline_smoothing: bool = True  # Apply B-spline smoothing to generated trajectories
@@ -197,6 +204,19 @@ class L2SafetyCFM(nn.Module):
             bspline_degree=config.bspline_degree,
             bspline_num_control_points=config.bspline_num_control_points,
             num_samples=config.num_trajectory_samples,
+            
+            # 启用 CBF 安全约束
+            use_cbf_guidance=config.use_cbf_constraint,
+            cbf_weight=1.0,
+            cbf_margin=config.cbf_margin,
+            cbf_alpha=1.0,
+            
+            # 启用多模态锚点生成
+            enable_multimodal_anchors=True,
+            multimodal_batch_size=config.num_trajectory_samples,
+            num_anchor_clusters=min(8, config.num_trajectory_samples // 8),  # 自适应聚类数
+            clustering_method="kmeans",
+            clustering_features="midpoint",
         )
         self.generator = TrajectoryGenerator(
             model=self.flow_model,
@@ -340,6 +360,8 @@ class L2SafetyCFM(nn.Module):
         # - 批次扩展（num_samples > 1 时）
         # - ODE 求解
         # - B 样条平滑
+        # - CBF 安全约束
+        # - 多模态锚点聚类
         result = self.generator.generate(
             start_pos=curr_p,
             goal_pos=goal_p,
@@ -348,6 +370,8 @@ class L2SafetyCFM(nn.Module):
             env_encoding=e_map,  # L2 层额外参数（从 cost_map 编码得到，与 forward 方法一致）
             num_samples=num_samples or self.config.num_trajectory_samples,
             return_raw=False,  # L2 层不需要原始输出
+            obstacle_positions=None,  # 可以从外部传入
+            cost_map=cost_map,  # 传递语义代价图用于 CBF
         )
         
         # Step 4: 重命名键以保持向后兼容

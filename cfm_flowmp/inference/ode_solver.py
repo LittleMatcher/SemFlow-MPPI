@@ -2,9 +2,9 @@
 流匹配推理的 ODE 求解器
 
 实现用于求解 ODE 的数值积分方法:
-    dx/dt = v_θ(x_t, t, c)
+    dx/dt = v_θ(x_t, t, c) + CBF_guidance(x_t)
 
-从 t=0 到 t=1 生成轨迹。
+从 t=0 到 t=1 生成轨迹。支持 CBF 安全约束的实时修正。
 
 可用求解器:
 - EulerSolver: 简单的一阶方法
@@ -43,6 +43,12 @@ class SolverConfig:
     
     # 预定义调度
     use_8step_schedule: bool = False  # 使用激进的 8 步调度
+    
+    # CBF 引导配置
+    use_cbf_guidance: bool = False
+    cbf_weight: float = 1.0
+    cbf_margin: float = 0.1
+    cbf_alpha: float = 1.0
 
 
 # 基于"统一生成-细化规划"的预定义时间调度
@@ -166,6 +172,7 @@ class RK4Solver:
         x_0: torch.Tensor,
         num_steps: int = None,
         time_schedule: List[float] = None,
+        cbf_guidance_fn: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         使用 RK4 方法求解 ODE
@@ -175,6 +182,7 @@ class RK4Solver:
             x_0: 初始状态 [B, T, D] 或 [B, D]
             num_steps: 积分步数（覆盖配置，如果提供 time_schedule 则忽略）
             time_schedule: 自定义时间调度（覆盖配置）
+            cbf_guidance_fn: CBF 引导函数 (可选)
             
         返回:
             t=1 处的最终状态 x_1，或如果 return_trajectory=True 则返回轨迹
@@ -201,9 +209,37 @@ class RK4Solver:
             
             # RK4 阶段
             k1 = velocity_fn(x, t)
+            if cbf_guidance_fn is not None:
+                # 提取位置和速度用于 CBF 引导
+                D = k1.shape[-1] // 3  # 假设 [p, v, a] 格式
+                positions = x[..., :D]
+                velocities = k1[..., :D]
+                cbf_correction = cbf_guidance_fn(positions, velocities)
+                k1 = k1 + torch.cat([cbf_correction, torch.zeros_like(cbf_correction), torch.zeros_like(cbf_correction)], dim=-1)
+            
             k2 = velocity_fn(x + 0.5 * dt * k1, t + 0.5 * dt)
+            if cbf_guidance_fn is not None:
+                x_mid = x + 0.5 * dt * k1
+                positions_mid = x_mid[..., :D]
+                velocities_mid = k2[..., :D]
+                cbf_correction_mid = cbf_guidance_fn(positions_mid, velocities_mid)
+                k2 = k2 + torch.cat([cbf_correction_mid, torch.zeros_like(cbf_correction_mid), torch.zeros_like(cbf_correction_mid)], dim=-1)
+            
             k3 = velocity_fn(x + 0.5 * dt * k2, t + 0.5 * dt)
+            if cbf_guidance_fn is not None:
+                x_mid = x + 0.5 * dt * k2
+                positions_mid = x_mid[..., :D]
+                velocities_mid = k3[..., :D]
+                cbf_correction_mid = cbf_guidance_fn(positions_mid, velocities_mid)
+                k3 = k3 + torch.cat([cbf_correction_mid, torch.zeros_like(cbf_correction_mid), torch.zeros_like(cbf_correction_mid)], dim=-1)
+            
             k4 = velocity_fn(x + dt * k3, t + dt)
+            if cbf_guidance_fn is not None:
+                x_end = x + dt * k3
+                positions_end = x_end[..., :D]
+                velocities_end = k4[..., :D]
+                cbf_correction_end = cbf_guidance_fn(positions_end, velocities_end)
+                k4 = k4 + torch.cat([cbf_correction_end, torch.zeros_like(cbf_correction_end), torch.zeros_like(cbf_correction_end)], dim=-1)
             
             # 更新状态
             x = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)

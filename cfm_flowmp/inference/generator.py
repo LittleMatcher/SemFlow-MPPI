@@ -54,6 +54,25 @@ class GeneratorConfig:
     warm_start_noise_scale: float = 0.1  # 热启动初始状态的噪声尺度
     warm_start_shift_mode: str = "zero_pad"  # 'zero_pad', 'repeat_last', 'predict'
     warm_start_memory_length: int = 1  # 要记住的先前轨迹数量
+    
+    # ============ CBF 安全约束设置 ============
+    use_cbf_guidance: bool = False
+    cbf_weight: float = 1.0
+    cbf_margin: float = 0.1
+    cbf_alpha: float = 1.0
+    
+    # ============ 多模态锚点生成设置 ============
+    # 步骤4: 多模态锚点筛选 (Anchors Selection)
+    enable_multimodal_anchors: bool = False  # 启用多模态锚点生成
+    multimodal_batch_size: int = 64         # 并行生成的轨迹数量
+    num_anchor_clusters: int = 3            # 同伦类数量 (如: 左、中、右)
+    clustering_method: str = "kmeans"       # "kmeans", "gmm", "simple"
+    
+    # 聚类特征配置
+    clustering_features: str = "midpoint"   # "midpoint", "endpoint", "curvature", "full_traj"
+    clustering_weight_position: float = 1.0
+    clustering_weight_velocity: float = 0.5
+    clustering_weight_curvature: float = 0.3
 
 
 # 来自"统一生成-细化规划"的 8 步调度
@@ -281,6 +300,10 @@ class TrajectoryGenerator:
             time_schedule=time_schedule,  # 使用计算出的 time_schedule
             return_trajectory=False,
             use_8step_schedule=self.config.use_8step_schedule,
+            use_cbf_guidance=self.config.use_cbf_guidance,
+            cbf_weight=self.config.cbf_weight,
+            cbf_margin=self.config.cbf_margin,
+            cbf_alpha=self.config.cbf_alpha,
         )
         self.solver = create_solver(self.config.solver_type, solver_config)
         self.time_schedule = time_schedule
@@ -294,6 +317,12 @@ class TrajectoryGenerator:
             )
         else:
             self.smoother = None
+        
+        # 创建多模态锚点选择器
+        if self.config.enable_multimodal_anchors:
+            self.anchor_selector = MultimodalAnchorSelector(self.config)
+        else:
+            self.anchor_selector = None
         
         # ============ 热启动内存 ============
         # 存储最近的最优轨迹用于时间热启动
@@ -398,6 +427,254 @@ class TrajectoryGenerator:
         warm_start_x0 = shifted_prior + noise
         
         return warm_start_x0
+
+
+class MultimodalAnchorSelector:
+    """
+    多模态锚点选择器
+    
+    实现步骤4: 多模态锚点筛选 (Anchors Selection)
+    1. 并行生成 N 条轨迹（不同随机噪声）
+    2. 使用 K-Means 或 GMM 进行聚类，识别同伦类
+    3. 选择每个聚类的代表轨迹作为离散锚点
+    """
+    
+    def __init__(self, config: GeneratorConfig):
+        self.config = config
+    
+    def extract_clustering_features(
+        self, 
+        trajectories: torch.Tensor,
+        velocities: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        从轨迹中提取聚类特征
+        
+        参数:
+            trajectories: 轨迹 [N, T, D]
+            velocities: 速度 [N, T, D] (可选)
+            
+        返回:
+            特征向量 [N, feature_dim]
+        """
+        N, T, D = trajectories.shape
+        device = trajectories.device
+        
+        if self.config.clustering_features == "midpoint":
+            # 使用轨迹中点作为特征
+            mid_idx = T // 2
+            features = trajectories[:, mid_idx, :]  # [N, D]
+            
+        elif self.config.clustering_features == "endpoint":
+            # 使用起点和终点作为特征
+            start_points = trajectories[:, 0, :]   # [N, D]
+            end_points = trajectories[:, -1, :]    # [N, D]
+            features = torch.cat([start_points, end_points], dim=-1)  # [N, 2*D]
+            
+        elif self.config.clustering_features == "curvature":
+            # 使用曲率特征
+            # 计算轨迹的二阶导数作为曲率的近似
+            if T >= 3:
+                second_derivative = trajectories[:, 2:, :] - 2 * trajectories[:, 1:-1, :] + trajectories[:, :-2, :]
+                curvature = torch.norm(second_derivative, dim=-1)  # [N, T-2]
+                features = torch.cat([
+                    trajectories[:, T//2, :],           # 中点位置
+                    curvature.mean(dim=-1, keepdim=True),  # 平均曲率
+                    curvature.max(dim=-1, keepdim=True)[0],  # 最大曲率
+                ], dim=-1)  # [N, D+2]
+            else:
+                features = trajectories[:, T//2, :]  # 回退到中点
+                
+        elif self.config.clustering_features == "full_traj":
+            # 使用完整轨迹（降维处理）
+            # 选择几个关键时间点
+            key_indices = torch.linspace(0, T-1, min(8, T), dtype=torch.long, device=device)
+            key_points = trajectories[:, key_indices, :].reshape(N, -1)  # [N, 8*D]
+            
+            # 加上速度特征（如果提供）
+            if velocities is not None:
+                key_velocities = velocities[:, key_indices, :].reshape(N, -1)
+                features = torch.cat([
+                    self.config.clustering_weight_position * key_points,
+                    self.config.clustering_weight_velocity * key_velocities,
+                ], dim=-1)
+            else:
+                features = key_points
+                
+        else:
+            # 默认：中点特征
+            mid_idx = T // 2
+            features = trajectories[:, mid_idx, :]
+        
+        return features
+    
+    def cluster_trajectories(
+        self,
+        trajectories: torch.Tensor,
+        velocities: Optional[torch.Tensor] = None,
+        accelerations: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        对轨迹进行聚类分析
+        
+        参数:
+            trajectories: 轨迹 [N, T, D]
+            velocities: 速度 [N, T, D] (可选)
+            accelerations: 加速度 [N, T, D] (可选)
+            
+        返回:
+            包含聚类结果的字典
+        """
+        N = trajectories.shape[0]
+        K = min(self.config.num_anchor_clusters, N)  # 确保聚类数不超过样本数
+        
+        # 提取特征
+        features = self.extract_clustering_features(trajectories, velocities)  # [N, F]
+        
+        if self.config.clustering_method == "simple":
+            # 简单方法：基于终点位置进行聚类
+            end_positions = trajectories[:, -1, :]  # [N, D]
+            
+            if D == 2:
+                # 2D情况：按角度分组（左、中、右）
+                angles = torch.atan2(end_positions[:, 1], end_positions[:, 0])
+                angle_bins = torch.linspace(-np.pi, np.pi, K+1, device=angles.device)
+                cluster_labels = torch.bucketize(angles, angle_bins) - 1
+                cluster_labels = torch.clamp(cluster_labels, 0, K-1)
+            else:
+                # 多维情况：按第一维坐标分组
+                coord_bins = torch.linspace(
+                    end_positions[:, 0].min(), end_positions[:, 0].max(), K+1, 
+                    device=end_positions.device
+                )
+                cluster_labels = torch.bucketize(end_positions[:, 0], coord_bins) - 1
+                cluster_labels = torch.clamp(cluster_labels, 0, K-1)
+        
+        else:
+            # K-Means 或 GMM 聚类
+            try:
+                if self.config.clustering_method == "kmeans":
+                    cluster_labels = self._kmeans_clustering(features, K)
+                elif self.config.clustering_method == "gmm":
+                    cluster_labels = self._gmm_clustering(features, K)
+                else:
+                    raise ValueError(f"未知聚类方法: {self.config.clustering_method}")
+                    
+            except Exception as e:
+                # 聚类失败时的回退策略
+                print(f"聚类失败，使用简单分组: {e}")
+                cluster_labels = torch.arange(N, device=trajectories.device) % K
+        
+        return {
+            'cluster_labels': cluster_labels,  # [N,]
+            'num_clusters': K,
+            'features': features,
+        }
+    
+    def _kmeans_clustering(self, features: torch.Tensor, K: int) -> torch.Tensor:
+        """K-Means 聚类实现"""
+        N, F = features.shape
+        device = features.device
+        
+        # 初始化聚类中心
+        centers = features[torch.randperm(N, device=device)[:K]]  # [K, F]
+        
+        # K-Means 迭代
+        for _ in range(20):  # 最大迭代次数
+            # 分配样本到最近的中心
+            distances = torch.cdist(features, centers)  # [N, K]
+            labels = distances.argmin(dim=-1)  # [N,]
+            
+            # 更新聚类中心
+            new_centers = torch.zeros_like(centers)
+            for k in range(K):
+                mask = (labels == k)
+                if mask.sum() > 0:
+                    new_centers[k] = features[mask].mean(dim=0)
+                else:
+                    new_centers[k] = centers[k]  # 保持原中心
+            
+            # 检查收敛
+            if torch.allclose(centers, new_centers, atol=1e-4):
+                break
+            centers = new_centers
+        
+        return labels
+    
+    def _gmm_clustering(self, features: torch.Tensor, K: int) -> torch.Tensor:
+        """GMM 聚类实现（简化版）"""
+        # 这里可以实现 EM 算法，或者回退到 K-Means
+        return self._kmeans_clustering(features, K)
+    
+    def select_anchor_trajectories(
+        self,
+        trajectories: torch.Tensor,
+        velocities: Optional[torch.Tensor] = None,
+        accelerations: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        选择代表性锚点轨迹
+        
+        参数:
+            trajectories: 所有生成的轨迹 [N, T, D]
+            velocities: 速度 [N, T, D] (可选)
+            accelerations: 加速度 [N, T, D] (可选)
+            
+        返回:
+            包含锚点轨迹的字典
+        """
+        # 聚类分析
+        clustering_result = self.cluster_trajectories(trajectories, velocities, accelerations)
+        cluster_labels = clustering_result['cluster_labels']
+        K = clustering_result['num_clusters']
+        
+        # 为每个聚类选择代表轨迹
+        anchor_indices = []
+        anchor_trajectories = []
+        anchor_velocities = []
+        anchor_accelerations = []
+        
+        for k in range(K):
+            # 找到属于当前聚类的轨迹
+            cluster_mask = (cluster_labels == k)
+            cluster_indices = torch.where(cluster_mask)[0]
+            
+            if len(cluster_indices) == 0:
+                # 空聚类：跳过或使用随机轨迹
+                continue
+            
+            # 选择聚类中心最近的轨迹作为代表
+            cluster_trajs = trajectories[cluster_mask]  # [n_k, T, D]
+            cluster_center = cluster_trajs.mean(dim=0)   # [T, D]
+            
+            # 计算每个轨迹到聚类中心的距离
+            distances = torch.norm(cluster_trajs - cluster_center.unsqueeze(0), dim=(1, 2))
+            closest_idx = distances.argmin()
+            representative_idx = cluster_indices[closest_idx]
+            
+            # 收集代表轨迹
+            anchor_indices.append(representative_idx.item())
+            anchor_trajectories.append(trajectories[representative_idx])
+            
+            if velocities is not None:
+                anchor_velocities.append(velocities[representative_idx])
+            if accelerations is not None:
+                anchor_accelerations.append(accelerations[representative_idx])
+        
+        # 构建结果
+        result = {
+            'anchor_indices': torch.tensor(anchor_indices, device=trajectories.device),
+            'anchor_trajectories': torch.stack(anchor_trajectories, dim=0) if anchor_trajectories else torch.empty(0, *trajectories.shape[1:], device=trajectories.device),
+            'num_anchors': len(anchor_trajectories),
+            'clustering_result': clustering_result,
+        }
+        
+        if anchor_velocities:
+            result['anchor_velocities'] = torch.stack(anchor_velocities, dim=0)
+        if anchor_accelerations:
+            result['anchor_accelerations'] = torch.stack(anchor_accelerations, dim=0)
+        
+        return result
     
     def update_warm_start_cache(
         self,
@@ -486,6 +763,8 @@ class TrajectoryGenerator:
         num_samples: int = None,
         return_raw: bool = False,
         warm_start_state: Optional[torch.Tensor] = None,
+        obstacle_positions: Optional[torch.Tensor] = None,
+        cost_map: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         为给定条件生成轨迹
@@ -500,27 +779,12 @@ class TrajectoryGenerator:
                         当 > 1 时，为每个条件生成多个轨迹
                         输出批次大小变为 B * num_samples
             return_raw: 是否在返回的字典中包含原始（未平滑）轨迹输出
-                       如果为 False，仅返回平滑后的轨迹
-                        注意：原始输出始终在内部计算（用于热启动），
-                        但仅在 return_raw=True 时包含在返回字典中
+            warm_start_state: 热启动状态 (可选)
+            obstacle_positions: 障碍物位置 [N_obs, D] (可选，用于 CBF)
+            cost_map: 语义代价图 [B, H, W] (可选，用于 CBF)
             
         返回:
-            包含以下内容的字典:
-                - 'positions': 生成的位置轨迹 [B*num_samples, T, D]
-                  当 num_samples=1 时: [B, T, D]
-                  当 num_samples>1 时: [B*num_samples, T, D] (L1 的 K 个锚点轨迹)
-                - 'velocities': 生成的速度轨迹 [B*num_samples, T, D]
-                - 'accelerations': 生成的加速度轨迹 [B*num_samples, T, D]
-                - 'raw_output': 原始模型输出 [B*num_samples, T, D*3] (仅当 return_raw=True)
-                - 'raw_positions': 平滑前的位置 [B*num_samples, T, D] (仅当 return_raw=True)
-                - 'raw_velocities': 平滑前的速度 [B*num_samples, T, D] (仅当 return_raw=True)
-                - 'raw_accelerations': 平滑前的加速度 [B*num_samples, T, D] (仅当 return_raw=True)
-                
-        注意:
-            此方法设计用于与 L1 MPPI 层配合：
-            - 当 num_samples > 1 时，输出包含 K = B*num_samples 个锚点轨迹
-            - L1 层可以直接使用这些作为锚点: initialize_from_l2_output(l2_output)
-            - 支持 L2 层的额外参数 (goal_vel, env_encoding) 以消除代码重复
+            包含轨迹和可选的多模态锚点的字典
         """
         self.model.eval()
         
@@ -601,8 +865,31 @@ class TrajectoryGenerator:
             start_pos, goal_pos, start_vel, goal_vel, env_encoding
         )
         
-        # 求解 ODE
-        x_1 = self.solver.solve(velocity_fn, x_0)
+        # 创建 CBF 引导函数（如果启用）
+        cbf_guidance_fn = None
+        if self.config.use_cbf_guidance and (obstacle_positions is not None or cost_map is not None):
+            from ..training.flow_matching import FlowMatchingConfig, compute_cbf_guidance
+            
+            # 创建 CBF 配置
+            cbf_config = FlowMatchingConfig(
+                state_dim=self.config.state_dim,
+                use_cbf_constraint=True,
+                cbf_weight=self.config.cbf_weight,
+                cbf_margin=self.config.cbf_margin,
+                cbf_alpha=self.config.cbf_alpha,
+            )
+            
+            def cbf_guidance_fn(positions, velocities):
+                return compute_cbf_guidance(
+                    positions, velocities, cbf_config,
+                    obstacle_positions, cost_map
+                )
+        
+        # 求解 ODE（带可选的 CBF 引导）
+        if hasattr(self.solver, 'solve') and 'cbf_guidance_fn' in self.solver.solve.__code__.co_varnames:
+            x_1 = self.solver.solve(velocity_fn, x_0, cbf_guidance_fn=cbf_guidance_fn)
+        else:
+            x_1 = self.solver.solve(velocity_fn, x_0)
         
         # 提取组件
         positions_raw = x_1[..., :D]
@@ -633,6 +920,39 @@ class TrajectoryGenerator:
             result['raw_accelerations'] = accelerations_raw
             result['raw_output'] = x_1
         
+        # ============ Multimodal Anchor Selection ============
+        # Step 4: Multimodal Anchor Selection
+        if self.config.enable_multimodal_anchors and self.anchor_selector is not None and num_samples > 1:
+            # Only perform clustering when generating multiple samples
+            anchor_result = self.anchor_selector.select_anchor_trajectories(
+                trajectories=result['positions'],
+                velocities=result.get('velocities'),
+                accelerations=result.get('accelerations'),
+            )
+            
+            # Replace original output with clustered anchor trajectories
+            # This ensures L1 MPPI receives discrete anchors representing different homotopy classes
+            result.update({
+                'positions': anchor_result['anchor_trajectories'],
+                'velocities': anchor_result.get('anchor_velocities', result.get('velocities')),
+                'accelerations': anchor_result.get('anchor_accelerations', result.get('accelerations')),
+                'num_anchors': anchor_result['num_anchors'],
+                'anchor_indices': anchor_result['anchor_indices'],
+                'clustering_info': anchor_result['clustering_result'],
+                
+                # Keep original multi-sample outputs for debugging
+                'all_positions': result['positions'] if 'all_positions' not in result else result['positions'],
+                'all_velocities': result['velocities'] if 'all_velocities' not in result else result['velocities'],
+                'all_accelerations': result['accelerations'] if 'all_accelerations' not in result else result['accelerations'],
+            })
+            
+            # Update batch size to match number of anchors
+            B = anchor_result['num_anchors']
+        
+        # Update warm start cache (if enabled)
+        if self.config.enable_warm_start and x_1 is not None:
+            self.update_warm_start_cache({'raw_output': x_1})
+        
         return result
     
     @torch.no_grad()
@@ -645,26 +965,26 @@ class TrajectoryGenerator:
         obstacle_fn: Optional[callable] = None,
     ) -> Dict[str, torch.Tensor]:
         """
-        使用分类器自由引导生成轨迹
+        Use classifier-free guidance to generate trajectories.
         
-        允许将生成引导到期望的属性，如避障
+        Allow guiding generation towards desired properties, such as obstacle avoidance.
         
-        参数:
-            start_pos: 起始位置 [B, D]
-            goal_pos: 目标位置 [B, D]
-            start_vel: 起始速度 [B, D]
-            guidance_scale: 引导尺度 (1.0 = 无引导)
-            obstacle_fn: 返回避障梯度的函数
+        Args:
+            start_pos: Starting position [B, D]
+            goal_pos: Goal position [B, D]
+            start_vel: Starting velocity [B, D]
+            guidance_scale: Guidance scale (1.0 = no guidance)
+            obstacle_fn: Function returning obstacle avoidance gradients
             
-        返回:
-            包含以下内容的字典:
-                - 'positions': 生成的位置轨迹 [B, T, D]
-                - 'velocities': 生成的速度轨迹 [B, T, D]
-                - 'accelerations': 生成的加速度轨迹 [B, T, D]
-                - 'raw_output': 原始模型输出 [B, T, D*3] (与 generate() 保持一致)
+        Returns:
+            Dictionary containing:
+                - 'positions': Generated position trajectories [B, T, D]
+                - 'velocities': Generated velocity trajectories [B, T, D]
+                - 'accelerations': Generated acceleration trajectories [B, T, D]
+                - 'raw_output': Raw model output [B, T, D*3] (consistent with generate())
         """
-        # 注意: 完整的 CFG 需要训练时使用条件丢弃的模型
-        # 这是带有可选避障引导的简化版本
+        # Note: Full CFG requires model trained with condition dropout
+        # This is a simplified version with optional obstacle avoidance guidance
         
         self.model.eval()
         
