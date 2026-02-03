@@ -248,6 +248,7 @@ SemFlow-MPPI是一个三层分层架构，融合语义理解、流匹配轨迹�
 - Violation Potential: `V_cbf = ReLU(-(dh/dt + α·h(x)))`
 - Vector Field Correction: `v̄ = v + λ·∇S_CBF(x)`
 
+
 ### Transformer Vector Field Prediction
 
 Based on "Unified Generation-Refinement Planning" and FlowMP official implementation.
