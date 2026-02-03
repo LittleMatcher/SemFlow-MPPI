@@ -176,19 +176,27 @@ class MultiScaleCostMapEncoder(nn.Module):
         self.num_scales = num_scales
         self.latent_dim = latent_dim
         
-        # Encoder for each scale
-        self.scale_encoders = nn.ModuleList([
-            CostMapEncoder(
-                input_channels=input_channels,
-                base_channels=base_channels,
-                latent_dim=latent_dim // num_scales,
-                num_downsample_layers=i + 2,
-                use_batch_norm=use_batch_norm,
-            )
-            for i in range(num_scales)
-        ])
+        # Calculate per-scale latent dimensions to ensure sum equals latent_dim
+        # This handles cases where latent_dim is not divisible by num_scales
+        per_scale_dim = latent_dim // num_scales
+        remainder = latent_dim % num_scales
         
-        # Fusion layer
+        # Encoder for each scale
+        self.scale_encoders = nn.ModuleList()
+        for i in range(num_scales):
+            # Last encoder gets the remainder to ensure total equals latent_dim
+            scale_latent_dim = per_scale_dim + (remainder if i == num_scales - 1 else 0)
+            self.scale_encoders.append(
+                CostMapEncoder(
+                    input_channels=input_channels,
+                    base_channels=base_channels,
+                    latent_dim=scale_latent_dim,
+                    num_downsample_layers=i + 2,
+                    use_batch_norm=use_batch_norm,
+                )
+            )
+        
+        # Fusion layer - input dimension is the sum of all scale dimensions (should equal latent_dim)
         self.fusion = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.ReLU(inplace=True),

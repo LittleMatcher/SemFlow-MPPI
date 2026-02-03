@@ -231,7 +231,7 @@ class BSplineSmoother:
 
 class TrajectoryGenerator:
     """
-    FlowMP 完整轨迹生成流程
+    完整轨迹生成流程
     
     通过以下方式生成轨迹：
     1. 从 N(0, I) 采样初始噪声
@@ -433,11 +433,20 @@ class TrajectoryGenerator:
         start_pos: torch.Tensor,
         goal_pos: torch.Tensor,
         start_vel: Optional[torch.Tensor] = None,
+        goal_vel: Optional[torch.Tensor] = None,
+        env_encoding: Optional[torch.Tensor] = None,
     ):
         """
         为 ODE 求解器创建速度函数
         
         速度函数包装模型并处理条件化。
+        
+        参数:
+            start_pos: 起始位置 [B, D]
+            goal_pos: 目标位置 [B, D]
+            start_vel: 起始速度 [B, D] (可选)
+            goal_vel: 目标速度 [B, D] (可选，用于 L2 层)
+            env_encoding: 环境编码 [B, env_dim] (可选，用于 L2 层)
         """
         def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             """
@@ -451,12 +460,16 @@ class TrajectoryGenerator:
                 速度场 [B, T, 6]
             """
             with torch.no_grad():
+                # 调用模型（所有参数都是可选的，模型 forward 方法会处理）
+                # FlowMPTransformer 和 FlowMPUNet1D 都支持这些可选参数
                 output = self.model(
                     x_t=x_t,
                     t=t,
                     start_pos=start_pos,
                     goal_pos=goal_pos,
                     start_vel=start_vel,
+                    goal_vel=goal_vel,
+                    env_encoding=env_encoding,
                 )
             return output
         
@@ -468,6 +481,8 @@ class TrajectoryGenerator:
         start_pos: torch.Tensor,
         goal_pos: torch.Tensor,
         start_vel: Optional[torch.Tensor] = None,
+        goal_vel: Optional[torch.Tensor] = None,
+        env_encoding: Optional[torch.Tensor] = None,
         num_samples: int = None,
         return_raw: bool = False,
         warm_start_state: Optional[torch.Tensor] = None,
@@ -479,6 +494,8 @@ class TrajectoryGenerator:
             start_pos: 起始位置 [B, D]
             goal_pos: 目标位置 [B, D]
             start_vel: 起始速度 [B, D] (可选)
+            goal_vel: 目标速度 [B, D] (可选，用于 L2 层)
+            env_encoding: 环境编码 [B, env_dim] (可选，用于 L2 层)
             num_samples: 每个条件的样本数
                         当 > 1 时，为每个条件生成多个轨迹
                         输出批次大小变为 B * num_samples
@@ -503,6 +520,7 @@ class TrajectoryGenerator:
             此方法设计用于与 L1 MPPI 层配合：
             - 当 num_samples > 1 时，输出包含 K = B*num_samples 个锚点轨迹
             - L1 层可以直接使用这些作为锚点: initialize_from_l2_output(l2_output)
+            - 支持 L2 层的额外参数 (goal_vel, env_encoding) 以消除代码重复
         """
         self.model.eval()
         
@@ -520,6 +538,10 @@ class TrajectoryGenerator:
             goal_pos = goal_pos.repeat(num_samples, 1)
             if start_vel is not None:
                 start_vel = start_vel.repeat(num_samples, 1)
+            if goal_vel is not None:
+                goal_vel = goal_vel.repeat(num_samples, 1)
+            if env_encoding is not None:
+                env_encoding = env_encoding.repeat(num_samples, 1)
             B = B_original * num_samples  # 扩展后的批次大小
         else:
             B = B_original  # 无需扩展
@@ -574,8 +596,10 @@ class TrajectoryGenerator:
             # 状态有 6 个通道: 位置(2) + 速度(2) + 加速度(2)
             x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
         
-        # 创建速度函数
-        velocity_fn = self._create_velocity_fn(start_pos, goal_pos, start_vel)
+        # 创建速度函数（支持 L2 层的额外参数）
+        velocity_fn = self._create_velocity_fn(
+            start_pos, goal_pos, start_vel, goal_vel, env_encoding
+        )
         
         # 求解 ODE
         x_1 = self.solver.solve(velocity_fn, x_0)

@@ -723,47 +723,41 @@ w_pred: torch.Size([32, 64, 2])
    │  │
    │  ├─ L2SafetyCFM.prepare_condition()
    │  │  │
-   │  │  ├─ 状态编码:
-   │  │  │  ├─ x_curr [B, 6] → Linear → [B, 128]
-   │  │  │  ├─ x_goal [B, 4] → Linear → [B, 128]
-   │  │  │  └─ w_style [B, 3] → Linear → [B, 64]
+   │  │  ├─ 直接拼接原始条件向量:
+   │  │  │  cond_vector = cat([x_curr, x_goal, e_map, (可选) w_style])
+   │  │  │  └─ 形状: [B, state_dim*3 + state_dim*2 + cost_map_latent_dim (+ style_dim)]
    │  │  │
-   │  │  ├─ 拼接融合:
-   │  │  │  combined = cat([e_map, x_curr_enc, x_goal_enc, w_style_enc])
-   │  │  │  └─ [B, 256+128+128+64] = [B, 576]
-   │  │  │
-   │  │  └─ 最终投影:
-   │  │     └─ Linear(576 → cond_dim) → [B, cond_dim]
+   │  │  └─ MLP 投影到时间/条件嵌入空间:
+   │  │     └─ condition_projector(cond_vector) → cond_embed [B, hidden_dim]
    │  │
-   │  └─ 输出: condition [B, cond_dim] 统一条件向量
+   │  └─ 输出: cond_embed [B, hidden_dim] 统一条件嵌入
    │
    ├─ 【步骤3】多模态轨迹生成
    │  │
    │  ├─ L2SafetyCFM.generate_trajectory_anchors()
    │  │  │
-   │  │  ├─ 为每个样本生成N=64个候选:
+   │  │  ├─ 内部统一调用 TrajectoryGenerator (cfm_flowmp.inference.generator):
    │  │  │  │
-   │  │  │  ├─ 重复条件: condition [B, cond_dim] → [B×N, cond_dim]
+   │  │  │  ├─ 构造 ODE 速度函数:
+   │  │  │  │  velocity_fn(x_t, t) = flow_model(
+   │  │  │  │      x_t=x_t, t=t,
+   │  │  │  │      start_pos=curr_p, goal_pos=goal_p,
+   │  │  │  │      start_vel=curr_v, goal_vel=goal_v,
+   │  │  │  │      env_encoding=e_map
+   │  │  │  │  )
    │  │  │  │
-   │  │  │  ├─ 采样高斯噪声:
-   │  │  │  │  x_0 ~ N(0, I) → [B×N, T, 6]
+   │  │  │  ├─ 为每个样本生成 N 条候选轨迹:
+   │  │  │  │  ├─ 重复条件: (curr_p, goal_p, curr_v, goal_v, e_map) → [B×N, ...]
+   │  │  │  │  ├─ 采样初始噪声 x_0 ~ N(0, I) → [B×N, T, 6]
+   │  │  │  │  ├─ 使用统一 ODE 求解器 (RK4 + 8-step 调度) 从 t=0 积分到 t=1
+   │  │  │  │  └─ 得到 x_1 [B×N, T, 6] = [p, v, a]
    │  │  │  │
-   │  │  │  ├─ ODE求解 (RK4):
-   │  │  │  │  ├─ velocity_fn = λ(x, t): model(x, t, condition)
-   │  │  │  │  ├─ 求解: x_0 → x_1 通过 dx/dt = velocity_fn(x, t)
-   │  │  │  │  └─ 输出: x_1 [B×N, T, 6]
-   │  │  │  │
-   │  │  │  └─ 提取动力学分量:
-   │  │  │     ├─ trajectories = x_1[..., :2]  [B×N, T, 2]
-   │  │  │     ├─ velocities = x_1[..., 2:4]  [B×N, T, 2]
-   │  │  │     └─ accelerations = x_1[..., 4:6]  [B×N, T, 2]
+   │  │  │  └─ (可选) 使用 BSplineSmoother 做 B-spline 平滑，消除数值噪声
    │  │  │
-   │  │  ├─ (可选) CBF安全约束:
-   │  │  │  └─ 投影轨迹到安全集合
-   │  │  │  └─ 保证 safety_margin = 0.1m
-   │  │  │
-   │  │  └─ (可选) B-spline平滑:
-   │  │     └─ 对每条轨迹进行平滑处理
+   │  │  └─ L2SafetyCFM 对返回结果重命名以保持接口稳定:
+   │  │     ├─ trajectories ← positions   [B×N, T, 2]
+   │  │     ├─ velocities  ← velocities  [B×N, T, 2]
+   │  │     └─ accelerations ← accelerations [B×N, T, 2]
    │  │
    │  └─ 输出: 
    │     ├─ trajectories [B×N, T, 2] 位置轨迹

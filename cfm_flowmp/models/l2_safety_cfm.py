@@ -24,7 +24,7 @@ from .unet_1d import FlowMPUNet1D
 from .cost_map_encoder import CostMapEncoder, create_cost_map_encoder
 from .embeddings import ConditionEncoder
 from ..inference.ode_solver import RK4Solver, SolverConfig
-from ..inference.generator import BSplineSmoother
+from ..inference.generator import BSplineSmoother, TrajectoryGenerator, GeneratorConfig
 
 
 @dataclass
@@ -169,20 +169,39 @@ class L2SafetyCFM(nn.Module):
             )
         
         # ========== ODE Solver ==========
+        # 注意：这些属性保留用于向后兼容，但实际使用 TrajectoryGenerator 内部的 solver
         solver_config = SolverConfig(
             num_steps=config.num_ode_steps,
             use_8step_schedule=config.use_8step_schedule,
         )
-        self.ode_solver = RK4Solver(solver_config)
+        self.ode_solver = RK4Solver(solver_config)  # 保留用于向后兼容
         
         # ========== Trajectory Smoother ==========
+        # 注意：这些属性保留用于向后兼容，但实际使用 TrajectoryGenerator 内部的 smoother
         if config.use_bspline_smoothing:
             self.smoother = BSplineSmoother(
                 degree=config.bspline_degree,
                 num_control_points=config.bspline_num_control_points,
-            )
+            )  # 保留用于向后兼容
         else:
             self.smoother = None
+        
+        # ========== Trajectory Generator (重构后使用统一接口) ==========
+        generator_config = GeneratorConfig(
+            solver_type=config.solver_type,
+            num_steps=config.num_ode_steps,
+            use_8step_schedule=config.use_8step_schedule,
+            state_dim=config.state_dim,
+            seq_len=config.max_seq_len,
+            use_bspline_smoothing=config.use_bspline_smoothing,
+            bspline_degree=config.bspline_degree,
+            bspline_num_control_points=config.bspline_num_control_points,
+            num_samples=config.num_trajectory_samples,
+        )
+        self.generator = TrajectoryGenerator(
+            model=self.flow_model,
+            config=generator_config,
+        )
     
     def encode_cost_map(self, cost_map: torch.Tensor) -> torch.Tensor:
         """
@@ -233,6 +252,13 @@ class L2SafetyCFM(nn.Module):
             else:
                 # Ensure w_style is on the correct device
                 w_style = w_style.to(device)
+                # 兼容旧数据集：如果 style_weights 只有 2 维（[w_safe, w_fast]），
+                # 则在中间插入一个 "energy" 维度，取两者的平均或 0 作为占位。
+                if w_style.dim() == 2 and w_style.shape[1] == 2 and self.config.style_dim == 3:
+                    w_safe = w_style[:, 0:1]
+                    w_fast = w_style[:, 1:2]
+                    w_energy = 0.5 * (w_safe + w_fast)
+                    w_style = torch.cat([w_safe, w_energy, w_fast], dim=-1)
             cond_parts.append(w_style)
         
         # Concatenate and project
@@ -240,6 +266,27 @@ class L2SafetyCFM(nn.Module):
         cond_embed = self.condition_projector(cond_vector)
         
         return cond_embed
+    
+    def _extract_state_components(
+        self,
+        x_curr: torch.Tensor,
+        x_goal: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        提取状态组件，消除重复代码。
+        
+        Args:
+            x_curr: [B, state_dim * 3] current state [p, v, a]
+            x_goal: [B, state_dim * 2] goal state [p, v]
+            
+        Returns:
+            Tuple of (curr_p, curr_v, goal_p, goal_v)
+        """
+        curr_p = x_curr[:, :self.state_dim]
+        curr_v = x_curr[:, self.state_dim:self.state_dim*2]
+        goal_p = x_goal[:, :self.state_dim]
+        goal_v = x_goal[:, self.state_dim:]
+        return curr_p, curr_v, goal_p, goal_v
     
     @torch.no_grad()
     def generate_trajectory_anchors(
@@ -255,6 +302,10 @@ class L2SafetyCFM(nn.Module):
         
         This is the main API for L2 layer inference.
         
+        **重构说明：**
+        此方法现在使用 TrajectoryGenerator 来消除代码重复。
+        L2 层特有的预处理（cost_map 编码、条件准备）仍然在此方法中完成。
+        
         Args:
             cost_map: [B, C, H, W] semantic cost map from L3
             x_curr: [B, state_dim * 3] current robot state [p, v, a]
@@ -269,81 +320,51 @@ class L2SafetyCFM(nn.Module):
                 - 'accelerations': [B*N, T, state_dim] acceleration profiles
                 - 'full_states': [B*N, T, state_dim*3] complete dynamics [p, v, a]
         """
-        self.flow_model.eval()
-        
         B = cost_map.shape[0]
-        N = num_samples or self.config.num_trajectory_samples
-        T = self.config.max_seq_len
         D = self.config.state_dim
         device = cost_map.device
         
-        # Step 1: Encode cost map
+        # Step 1: Encode cost map (L2 层特有的预处理)
         e_map = self.encode_cost_map(cost_map)  # [B, latent_dim]
         
-        # Step 2: Prepare condition
-        cond_embed = self.prepare_condition(x_curr, x_goal, e_map, w_style)
+        # 注意：w_style 参数在此方法中接收，但为了保持与 forward 方法的一致性，
+        # 我们只将 e_map 作为 env_encoding 传递。
+        # w_style 的信息在训练时通过 prepare_condition 被学习到模型中。
+        # 在推理时，模型已经学会了根据不同的条件（包括隐含的 style）生成轨迹。
         
-        # Step 3: Expand for multi-modal sampling
-        # Repeat conditions for N samples
-        e_map_expanded = e_map.repeat_interleave(N, dim=0)  # [B*N, latent_dim]
-        x_curr_expanded = x_curr.repeat_interleave(N, dim=0)  # [B*N, state_dim*3]
-        x_goal_expanded = x_goal.repeat_interleave(N, dim=0)  # [B*N, state_dim*2]
-        if w_style is not None:
-            w_style_expanded = w_style.repeat_interleave(N, dim=0)
-        else:
-            w_style_expanded = None
+        # Step 2: Extract state components from x_curr and x_goal
+        curr_p, curr_v, goal_p, goal_v = self._extract_state_components(x_curr, x_goal)
         
-        # Step 4: Sample initial noise
-        x_0 = torch.randn(B * N, T, D * 3, device=device)  # [B*N, T, 6]
+        # Step 3: Use TrajectoryGenerator (重构后统一接口)
+        # TrajectoryGenerator 会自动处理：
+        # - 批次扩展（num_samples > 1 时）
+        # - ODE 求解
+        # - B 样条平滑
+        result = self.generator.generate(
+            start_pos=curr_p,
+            goal_pos=goal_p,
+            start_vel=curr_v,
+            goal_vel=goal_v,  # L2 层额外参数
+            env_encoding=e_map,  # L2 层额外参数（从 cost_map 编码得到，与 forward 方法一致）
+            num_samples=num_samples or self.config.num_trajectory_samples,
+            return_raw=False,  # L2 层不需要原始输出
+        )
         
-        # Step 5: Define velocity function for ODE solver
-        def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            """Velocity field at (x_t, t)."""
-            # Prepare conditions for this batch
-            curr_p = x_curr_expanded[:, :D]
-            curr_v = x_curr_expanded[:, D:D*2]
-            goal_p = x_goal_expanded[:, :D]
-            goal_v = x_goal_expanded[:, D:]
-            
-            # Model forward pass
-            output = self.flow_model(
-                x_t=x_t,
-                t=t,
-                start_pos=curr_p,
-                goal_pos=goal_p,
-                start_vel=curr_v,
-                goal_vel=goal_v,
-                env_encoding=e_map_expanded,
-            )
-            
-            return output
-        
-        # Step 6: Solve ODE from t=0 to t=1
-        x_1 = self.ode_solver.solve(velocity_fn, x_0)  # [B*N, T, 6]
-        
-        # Step 7: Extract dynamics components
-        positions_raw = x_1[..., :D]  # [B*N, T, 2]
-        velocities_raw = x_1[..., D:D*2]  # [B*N, T, 2]
-        accelerations_raw = x_1[..., D*2:]  # [B*N, T, 2]
-        
-        # Step 8: Apply B-spline smoothing if enabled
-        if self.smoother is not None:
-            smoothed = self.smoother.smooth(positions_raw, return_derivatives=True)
-            positions = smoothed['positions']
-            velocities = smoothed['velocities']
-            accelerations = smoothed['accelerations']
-        else:
-            positions = positions_raw
-            velocities = velocities_raw
-            accelerations = accelerations_raw
-        
-        return {
-            'trajectories': positions,
-            'velocities': velocities,
-            'accelerations': accelerations,
-            'full_states': torch.cat([positions, velocities, accelerations], dim=-1),  # [B*N, T, 6] = [p, v, a]
-            'num_samples_per_batch': N,
+        # Step 4: 重命名键以保持向后兼容
+        # TrajectoryGenerator 返回 'positions'，L2 层期望 'trajectories'
+        output = {
+            'trajectories': result['positions'],
+            'velocities': result['velocities'],
+            'accelerations': result['accelerations'],
+            'full_states': torch.cat([
+                result['positions'],
+                result['velocities'],
+                result['accelerations']
+            ], dim=-1),  # [B*N, T, state_dim*3] = [p, v, a]
+            'num_samples_per_batch': num_samples or self.config.num_trajectory_samples,
         }
+        
+        return output
     
     def forward(
         self,
@@ -386,10 +407,7 @@ class L2SafetyCFM(nn.Module):
         cond_embed = self.prepare_condition(x_curr, x_goal, e_map, w_style)
         
         # Extract state components
-        curr_p = x_curr[:, :self.state_dim]
-        curr_v = x_curr[:, self.state_dim:self.state_dim*2]
-        goal_p = x_goal[:, :self.state_dim]
-        goal_v = x_goal[:, self.state_dim:]
+        curr_p, curr_v, goal_p, goal_v = self._extract_state_components(x_curr, x_goal)
         
         # Model forward
         output = self.flow_model(

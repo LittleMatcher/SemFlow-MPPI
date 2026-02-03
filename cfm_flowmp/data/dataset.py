@@ -6,10 +6,9 @@ Provides dataset implementations for loading expert trajectories:
 - SyntheticTrajectoryDataset: Generate synthetic trajectories for testing
 """
 
-import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
 
@@ -991,7 +990,25 @@ def create_l2_dataloaders(
     elif data_source == "generated":
         if not data_dir:
             raise ValueError("data_dir required when data_source='generated'")
-        full_ds = FlowMPEnvDataset(data_path=data_dir)
+        data_root = Path(data_dir)
+        # 支持三种情况：
+        # 1) data_dir 直接指向 data.npz 文件
+        # 2) data_dir 是包含 data.npz 的单个目录
+        # 3) data_dir 是父目录，下面有多个子目录，每个子目录里有 data.npz（自动合并）
+        datasets = []
+        if data_root.is_file() and data_root.suffix == ".npz":
+            datasets.append(FlowMPEnvDataset(data_path=str(data_root)))
+        elif data_root.is_dir():
+            direct_npz = data_root / "data.npz"
+            if direct_npz.exists():
+                datasets.append(FlowMPEnvDataset(data_path=str(data_root)))
+            else:
+                for sub in sorted(data_root.iterdir()):
+                    if sub.is_dir() and (sub / "data.npz").exists():
+                        datasets.append(FlowMPEnvDataset(data_path=str(sub)))
+        if not datasets:
+            raise FileNotFoundError(f"No data.npz found under {data_dir}")
+        full_ds = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
         n = len(full_ds)
         n_train = int(n * train_ratio)
         n_val = n - n_train

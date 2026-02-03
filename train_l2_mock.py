@@ -18,12 +18,10 @@ If Train/Val Loss hardly drop (especially Acc >> Pos,Vel):
 import argparse
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 from pathlib import Path
-import numpy as np
 from tqdm import tqdm
 
-from cfm_flowmp.data import MockL3Dataset, FlowMPEnvDataset, create_l2_dataloaders
+from cfm_flowmp.data import create_l2_dataloaders
 from cfm_flowmp.models import create_l2_safety_cfm, L2Config
 from cfm_flowmp.training import FlowMatchingLoss, FlowMatchingConfig, FlowInterpolator
 
@@ -93,50 +91,18 @@ def parse_args():
 
 def create_datasets_and_loaders(args):
     """Create training and validation datasets and dataloaders."""
-    if args.data_source == "generated":
-        if not args.data_dir:
-            raise ValueError("--data_dir is required when --data_source=generated")
-        train_loader, val_loader = create_l2_dataloaders(
-            data_source="generated",
-            data_dir=args.data_dir,
-            batch_size=args.batch_size,
-            map_size=args.map_size,
-            seq_len=args.seq_len,
-            train_ratio=args.train_ratio,
-            seed=42,
-        )
-        return train_loader, val_loader
-    
-    train_dataset = MockL3Dataset(
-        num_samples=args.num_samples,
+    return create_l2_dataloaders(
+        data_source=args.data_source,
+        data_dir=args.data_dir,
+        num_train=args.num_samples,
+        num_val=args.val_samples,
+        batch_size=args.batch_size,
         map_size=args.map_size,
         seq_len=args.seq_len,
         style_mode=args.style_mode,
+        train_ratio=args.train_ratio,
         seed=42,
     )
-    val_dataset = MockL3Dataset(
-        num_samples=args.val_samples,
-        map_size=args.map_size,
-        seq_len=args.seq_len,
-        style_mode=args.style_mode,
-        seed=123,
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-    )
-    return train_loader, val_loader
 
 
 def create_model(args):

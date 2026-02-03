@@ -205,8 +205,11 @@ class FlowMPUNet1D(nn.Module):
             out_ch = down_channels[i]
             self.upsamples.append(Upsample1D(in_ch, out_ch))
             blocks = nn.ModuleList()
-            for _ in range(num_res_blocks):
-                blocks.append(ResBlock1D(out_ch + out_ch, out_ch, cond_dim, dropout=dropout))
+            for j in range(num_res_blocks):
+                # First block takes concatenated skip (out_ch + out_ch)
+                # Subsequent blocks take just out_ch
+                in_block_ch = out_ch + out_ch if j == 0 else out_ch
+                blocks.append(ResBlock1D(in_block_ch, out_ch, cond_dim, dropout=dropout))
             self.up_blocks.append(blocks)
             in_ch = out_ch
 

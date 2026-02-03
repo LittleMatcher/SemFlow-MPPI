@@ -1,5 +1,5 @@
 """
-FlowMP Transformer Architecture
+Transformer Architecture
 
 A Transformer-based conditional vector field prediction network for
 trajectory generation using Conditional Flow Matching.
@@ -15,7 +15,6 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from einops import rearrange, repeat
 from typing import Optional, Tuple
 
 from .embeddings import (
@@ -333,12 +332,6 @@ class FlowMPTransformer(nn.Module):
     
     A Transformer-based architecture for predicting the vector field
     in Conditional Flow Matching for trajectory generation.
-    
-    Based on:
-    - FlowMP official implementation (https://github.com/mkhangg/flow_mp)
-    - "Unified Generation-Refinement Planning" architecture guidelines
-    - DiT-style AdaLN conditioning
-    
     Input:
         - x_t: Current interpolated state [B, T, 6] containing (x, y, vx, vy, ax, ay)
         - t: Flow time ∈ [0, 1]

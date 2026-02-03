@@ -12,8 +12,6 @@ Contains:
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
 
 
 class GaussianFourierProjection(nn.Module):
@@ -93,13 +91,17 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.max_period = max_period
         
         # Precompute frequency bands
-        half_dim = embed_dim // 2
+        # Use ceil to handle odd embed_dim correctly
+        half_dim = (embed_dim + 1) // 2
         freqs = torch.exp(
             -math.log(max_period) * torch.arange(half_dim, dtype=torch.float32) / half_dim
         )
         self.register_buffer('freqs', freqs)
         
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
+        # Output projection: input will be min(embed_dim, half_dim * 2)
+        # For even embed_dim: half_dim * 2 = embed_dim
+        # For odd embed_dim: half_dim * 2 = embed_dim + 1, so we need to handle it
+        self.output_proj = nn.Linear(half_dim * 2, embed_dim)
     
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
@@ -117,8 +119,9 @@ class SinusoidalPositionalEncoding(nn.Module):
         
         # Compute embeddings
         args = t * self.freqs[None, :]  # [B, half_dim]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # [B, embed_dim]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # [B, half_dim * 2]
         
+        # Project to desired dimension (handles odd embed_dim by truncating/padding)
         return self.output_proj(embedding)
 
 

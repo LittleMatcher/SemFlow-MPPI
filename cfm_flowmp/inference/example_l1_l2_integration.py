@@ -9,12 +9,20 @@ L1-L2 集成示例
 3. L1 返回最优控制序列，可用于闭环回流
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import torch
 import numpy as np
 from typing import Dict, Optional
 
-from .generator import TrajectoryGenerator, GeneratorConfig
-from .l1_reactive_control import L1ReactiveController, L1Config
+from cfm_flowmp.inference.generator import TrajectoryGenerator, GeneratorConfig
+from cfm_flowmp.inference.l1_reactive_control import L1ReactiveController, L1Config
 
 
 def example_l1_l2_integration():

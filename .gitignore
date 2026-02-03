@@ -57,7 +57,7 @@ datasets/
 *.npy
 *.pkl
 *.pickle
-*.png
+# *.png
 *.jpg
 *.jpeg
 *.gif

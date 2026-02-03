@@ -1,0 +1,611 @@
+"""
+模型预测路径积分 (MPPI) 与 B-Spline 轨迹参数化
+
+关键创新：不是采样原始控制序列，而是采样 B-Spline 控制点。
+这确保了光滑轨迹（C2 连续），如 Motion Planning Diffusion (arXiv:2308.01557) 中所示
+
+MPPI 算法：
+1. 通过扰动 B-spline 控制点采样 K 条轨迹
+2. 评估每条轨迹的代价
+3. 计算重要性权重：w_k = exp(-lambda * cost_k)
+4. 将控制点更新为加权平均
+"""
+import numpy as np
+from typing import Optional, Tuple, Dict
+from .bspline_trajectory import BSplineTrajectory
+from .cost_functions import CostFunction
+from .dynamics import DifferentialDriveRobot
+from multiprocessing import cpu_count
+from concurrent.futures import ProcessPoolExecutor
+from functools import partial
+
+
+class MPPI_BSpline:
+    """
+    带 B-Spline 轨迹参数化的 MPPI
+    """
+    
+    def __init__(self,
+                 cost_function: CostFunction,
+                 n_samples: int = 100,
+                 n_control_points: int = 10,
+                 bspline_degree: int = 3,
+                 time_horizon: float = 5.0,
+                 n_timesteps: int = 50,
+                 temperature: float = 1.0,
+                 noise_std: float = 0.5,
+                 bounds: Tuple[float, float, float, float] = (-10, 10, -10, 10),
+                 elite_ratio: float = 0.1,
+                 n_jobs: int = 1):
+        """
+        Args:
+            cost_function: 要优化的代价函数
+            n_samples: 轨迹采样数（MPPI 中的 K）
+            n_control_points: B-spline 控制点数量
+            bspline_degree: B-spline 度数（3 表示三次）
+            time_horizon: 规划时间范围（秒）
+            n_timesteps: 评估轨迹的时间步数
+            temperature: 逆温度（MPPI 中的 lambda）。
+                        较低 = 更多利用，较高 = 更多探索
+            noise_std: 添加到控制点的噪声标准差
+            bounds: 环境边界 (x_min, x_max, y_min, y_max)
+            elite_ratio: Elite样本比例（0-1），只用top-k样本更新。
+                        例如0.05表示只用代价最低的5%样本加权平均，
+                        可显著减少多模态平均导致的自交环。设为1.0则使用全部样本（标准MPPI）
+            n_jobs: 并行处理使用的CPU核心数。1表示不并行，-1表示使用所有CPU核心
+        """
+        self.cost_function = cost_function
+        self.n_samples = n_samples
+        self.n_control_points = n_control_points
+        self.time_horizon = time_horizon
+        self.n_timesteps = n_timesteps
+        self.temperature = temperature
+        self.noise_std = noise_std
+        self.bounds = bounds
+        self.elite_ratio = np.clip(elite_ratio, 0.0, 1.0)
+        self.n_elite = max(1, int(self.n_samples * self.elite_ratio))
+        
+        # 并行处理配置
+        self.n_jobs = n_jobs if n_jobs > 0 else cpu_count()
+        self.use_parallel = self.n_jobs > 1
+        self._pool = None  # 延迟创建进程池
+        
+        # B-Spline 轨迹生成器
+        self.bspline = BSplineTrajectory(
+            degree=bspline_degree,
+            n_control_points=n_control_points,
+            time_horizon=time_horizon,
+            dim=2
+        )
+        
+        # 当前最佳控制点
+        self.control_points = None
+        
+        # 用于跟踪
+        self.iteration = 0
+        self.cost_history = []
+        
+        # 跟踪所有迭代中的最佳解
+        self.best_cost_all_time = np.inf
+        self.best_trajectory_all_time = None
+        self.best_control_points_all_time = None
+        self.best_iteration = -1
+    
+    def _get_pool(self):
+        """获取或创建进程池"""
+        if self.use_parallel and self._pool is None:
+            self._pool = ProcessPoolExecutor(max_workers=self.n_jobs)
+            print(f"✓ 创建进程池：{self.n_jobs} 个工作进程 (ProcessPoolExecutor)")
+        return self._pool
+    
+    def __del__(self):
+        """析构函数，清理进程池"""
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+        
+    def initialize(self, start: np.ndarray, goal: np.ndarray):
+        """用从起始到目标的直线初始化
+        Args:
+            start: 起始位置 (2,)
+            goal: 目标位置 (2,)
+        """
+        # 线性插值
+        alphas = np.linspace(0, 1, self.n_control_points).reshape(-1, 1)
+        self.control_points = (1 - alphas) * start + alphas * goal
+        self.start = start
+        self.goal = goal
+        
+    def _get_collision_params(self):
+        """从代价函数中获取碰撞检测参数
+        
+        Returns:
+            env, robot_radius 或 None, None
+        """
+        # 查找CollisionCost
+        if hasattr(self.cost_function, 'cost_functions'):
+            for cost_fn in self.cost_function.cost_functions:
+                if hasattr(cost_fn, 'env') and hasattr(cost_fn, 'robot_radius'):
+                    return cost_fn.env, cost_fn.robot_radius
+        elif hasattr(self.cost_function, 'env') and hasattr(self.cost_function, 'robot_radius'):
+            return self.cost_function.env, self.cost_function.robot_radius
+        return None, None
+    
+    def _check_path_segment_collision(self, p1: np.ndarray, p2: np.ndarray,
+                                     env, robot_radius: float,
+                                     n_checks: int = 10) -> bool:
+        """检查路径段是否穿过障碍物
+        
+        Args:
+            p1, p2: 路径段的起点和终点 (2,)
+            env: 环境对象
+            robot_radius: 机器人半径
+            n_checks: 在路径段上检查的点数
+        Returns:
+            True if collision detected
+        """
+        # 在路径段上均匀采样点
+        t_vals = np.linspace(0, 1, n_checks)
+        points = p1[np.newaxis, :] + t_vals[:, np.newaxis] * (p2 - p1)[np.newaxis, :]
+        
+        # 检查所有采样点
+        sdf = env.compute_sdf(points)
+        
+        # 如果任何点的SDF < robot_radius，则认为碰撞
+        return np.any(sdf < robot_radius)
+    
+    def _check_trajectory_collision(self, trajectory: np.ndarray) -> bool:
+        """检查轨迹是否有碰撞（点碰撞或路径段穿透）
+        
+        Args:
+            trajectory: 轨迹点 (T, 2)
+        Returns:
+            True if collision detected
+        """
+        # 获取环境参数
+        env, robot_radius = self._get_collision_params()
+        if env is None:
+            return False  # 如果没有碰撞代价函数，跳过检查
+        
+        # 1. 检查轨迹点是否在障碍物内
+        sdf = env.compute_sdf(trajectory)
+        if np.any(sdf < robot_radius):
+            return True
+        
+        # 2. 检查相邻点之间的路径段是否穿过障碍物
+        for i in range(len(trajectory) - 1):
+            if self._check_path_segment_collision(
+                trajectory[i], trajectory[i+1], env, robot_radius
+            ):
+                return True
+        
+        return False
+    
+    @staticmethod
+    def _evaluate_single_trajectory(args):
+        """用于并行处理的静态方法 - 评估单条轨迹
+        Args:
+            args: (control_points, bspline, n_timesteps)
+        Returns:
+            trajectory: 形状 (n_timesteps, 2)
+        """
+        control_points, bspline_params, n_timesteps = args
+        # 重新创建BSpline对象（避免pickle问题）
+        bspline = BSplineTrajectory(
+            degree=bspline_params['degree'],
+            n_control_points=bspline_params['n_control_points'],
+            time_horizon=bspline_params['time_horizon'],
+            dim=2
+        )
+        return bspline.evaluate(control_points, n_samples=n_timesteps)        
+    @staticmethod
+    def _evaluate_trajectory_batch(args):
+        """批量评估多条轨迹 - 提高任务粒度
+        Args:
+            args: (control_points_batch, bspline_params, n_timesteps)
+        Returns:
+            trajectories: 列表，每个元素是 (n_timesteps, 2)
+        """
+        control_points_batch, bspline_params, n_timesteps = args
+        # 重新创建BSpline对象
+        bspline = BSplineTrajectory(
+            degree=bspline_params['degree'],
+            n_control_points=bspline_params['n_control_points'],
+            time_horizon=bspline_params['time_horizon'],
+            dim=2
+        )
+        # 批量计算
+        return [bspline.evaluate(cp, n_samples=n_timesteps) for cp in control_points_batch]    @staticmethod
+    def _check_single_trajectory_validity(args):
+        """用于并行处理的静态方法 - 检查单条轨迹是否有效
+        Args:
+            args: (trajectory, bounds, robot_radius, obstacles_data)
+        Returns:
+            is_invalid: bool，True表示轨迹无效
+        """
+        traj, bounds, robot_radius, obstacles_data = args
+        x_min, x_max, y_min, y_max = bounds
+        
+        # 1) 地图边界检查
+        out_of_bounds = (
+            (traj[:, 0] < x_min + robot_radius) |
+            (traj[:, 0] > x_max - robot_radius) |
+            (traj[:, 1] < y_min + robot_radius) |
+            (traj[:, 1] > y_max - robot_radius)
+        )
+        if np.any(out_of_bounds):
+            return True
+        
+        # 2) 障碍物碰撞检查（简化版）
+        # 注意：这里只做粗略检查，详细碰撞检查由代价函数处理
+        if obstacles_data is not None:
+            rectangles, circles = obstacles_data
+            
+            # 检查矩形障碍物
+            for (x1, x2, y1, y2) in rectangles:
+                # 检查轨迹点是否在矩形内（考虑机器人半径）
+                in_rect = (
+                    (traj[:, 0] >= x1 - robot_radius) &
+                    (traj[:, 0] <= x2 + robot_radius) &
+                    (traj[:, 1] >= y1 - robot_radius) &
+                    (traj[:, 1] <= y2 + robot_radius)
+                )
+                if np.any(in_rect):
+                    return True
+            
+            # 检查圆形障碍物
+            for (cx, cy, r) in circles:
+                center = np.array([cx, cy])
+                dist = np.linalg.norm(traj - center, axis=1)
+                if np.any(dist < r + robot_radius):
+                    return True
+        
+        return False
+    
+    @staticmethod
+    def _check_trajectory_batch_validity(args):
+        """批量检查多条轨迹的有效性 - 提高任务粒度
+        Args:
+            args: (trajectories_batch, bounds, robot_radius, obstacles_data)
+        Returns:
+            invalid_mask: 列表，每个元素是bool
+        """
+        trajectories_batch, bounds, robot_radius, obstacles_data = args
+        return [MPPI_BSpline._check_single_trajectory_validity(
+            (traj, bounds, robot_radius, obstacles_data)
+        ) for traj in trajectories_batch]    
+    def sample_trajectories(self) -> Tuple[np.ndarray, np.ndarray]:
+        """通过扰动控制点采样轨迹
+        
+        不再过滤碰撞轨迹，完全依赖代价函数来指导优化。
+        这允许更多样化的采样和更好的探索。
+        
+        Returns:
+            sampled_control_points: 形状 (n_samples, n_control_points, 2)
+            trajectories: 形状 (n_samples, n_timesteps, 2)
+        """
+        # 向控制点添加噪声（除了起始和目标）
+        sampled_control_points = self.bspline.add_noise(
+            np.tile(self.control_points[np.newaxis, :, :], (self.n_samples, 1, 1)),
+            self.noise_std
+        )
+        
+        # 计算所有轨迹
+        if self.use_parallel:
+            # 并行计算轨迹 - 使用批处理提高任务粒度
+            bspline_params = {
+                'degree': self.bspline.degree,
+                'n_control_points': self.n_control_points,
+                'time_horizon': self.time_horizon
+            }
+            
+            # 将样本分成批，每批由一个工作进程处理
+            batch_size = max(1, self.n_samples // self.n_jobs)
+            batches = []
+            for i in range(0, self.n_samples, batch_size):
+                end_idx = min(i + batch_size, self.n_samples)
+                batch = sampled_control_points[i:end_idx]
+                batches.append((batch, bspline_params, self.n_timesteps))
+            
+            executor = self._get_pool()
+            # 每个工作进程处理一个批次
+            batch_results = list(executor.map(self._evaluate_trajectory_batch, batches))
+            # 展平结果
+            trajectories = [traj for batch in batch_results for traj in batch]
+            trajectories = np.stack(trajectories, axis=0)
+        else:
+            # 串行计算（原始方式）
+            trajectories = []
+            for i in range(self.n_samples):
+                traj = self.bspline.evaluate(
+                    sampled_control_points[i], 
+                    n_samples=self.n_timesteps
+                )
+                trajectories.append(traj)
+            trajectories = np.stack(trajectories, axis=0)
+        
+        return sampled_control_points, trajectories
+    
+    def evaluate_trajectories(self, trajectories: np.ndarray) -> np.ndarray:
+        """评估每条轨迹的代价
+        Args:
+            trajectories: 形状 (n_samples, n_timesteps, 2)
+        Returns:
+            costs: 形状 (n_samples,)
+        """
+        # 为平滑代价计算导数
+        batch_control_points = []
+        
+        # 我们需要为每条轨迹重新计算控制点
+        # 由于我们已经有了轨迹，我们将计算有限差分
+        velocities = np.diff(trajectories, axis=1) / (self.time_horizon / self.n_timesteps)
+        accelerations = np.diff(velocities, axis=1) / (self.time_horizon / self.n_timesteps)
+        jerks = np.diff(accelerations, axis=1) / (self.time_horizon / self.n_timesteps)
+        
+        # 填充以匹配轨迹长度
+        velocities = np.concatenate([velocities, velocities[:, -1:, :]], axis=1)
+        accelerations = np.concatenate([accelerations, accelerations[:, -1:, :], 
+                                       accelerations[:, -1:, :]], axis=1)
+        jerks = np.concatenate([jerks, jerks[:, -1:, :], 
+                               jerks[:, -1:, :], jerks[:, -1:, :]], axis=1)
+        
+        # 计算代价
+        costs = self.cost_function(
+            positions=trajectories,
+            velocities=velocities,
+            accelerations=accelerations,
+            jerks=jerks
+        )
+        
+        return costs
+    
+    def compute_weights(self, costs: np.ndarray) -> np.ndarray:
+        """使用带温度的 softmax 计算重要性权重（支持elite filtering）
+        Args:
+            costs: 形状 (n_samples,)
+        Returns:
+            weights: 形状 (n_samples,)，归一化为和为 1
+        """
+        # Elite filtering: 只保留代价最低的 top-k 样本
+        if self.elite_ratio < 1.0:
+            # 找到 elite 样本的索引（代价最小的 n_elite 个）
+            elite_indices = np.argpartition(costs, self.n_elite - 1)[:self.n_elite]
+            # 创建 mask，只有 elite 样本为 True
+            elite_mask = np.zeros(len(costs), dtype=bool)
+            elite_mask[elite_indices] = True
+        else:
+            # 使用全部样本（标准 MPPI）
+            elite_mask = np.ones(len(costs), dtype=bool)
+        
+        # 为数值稳定性归一化代价
+        costs = costs - np.min(costs)
+        
+        # 重要性权重：exp(-lambda * cost)
+        # 注意：在我们的公式中，temperature = 1/lambda
+        weights = np.exp(-costs / (self.temperature + 1e-8))
+        
+        # 将非 elite 样本的权重置零
+        weights = np.where(elite_mask, weights, 0.0)
+        
+        # 归一化（只在 elite 样本上）
+        weights = weights / (np.sum(weights) + 1e-8)
+        
+        return weights
+    
+    def update(self, sampled_control_points: np.ndarray, 
+              weights: np.ndarray):
+        """使用加权平均更新控制点
+        Args:
+            sampled_control_points: 形状 (n_samples, n_control_points, 2)
+            weights: 形状 (n_samples,)
+        """
+        # 加权平均
+        # weights: (n_samples,) -> (n_samples, 1, 1)
+        weights_expanded = weights[:, np.newaxis, np.newaxis]
+        
+        # 更新所有控制点
+        new_control_points = np.sum(
+            weights_expanded * sampled_control_points, 
+            axis=0
+        )
+        
+        # 保持起始和目标固定
+        new_control_points[0, :] = self.start
+        new_control_points[-1, :] = self.goal
+        
+        self.control_points = new_control_points
+    
+    def step(self) -> Dict:
+        """执行一次 MPPI 迭代
+        Returns:
+            info: 包含迭代信息的字典
+        """
+        # 采样轨迹
+        sampled_control_points, trajectories = self.sample_trajectories()
+        
+        # 评估代价
+        costs = self.evaluate_trajectories(trajectories)
+        
+        # 对明显不可行的轨迹（碰撞或越界）施加巨大惩罚，
+        # 确保最终最优轨迹不会穿过障碍物或超出地图边界
+        env, robot_radius = self._get_collision_params()
+        if env is not None:
+            x_min, x_max, y_min, y_max = self.bounds
+            
+            if self.use_parallel:
+                # 并行碰撞检查
+                # 准备障碍物数据（可序列化的格式）
+                obstacles_data = None
+                if env is not None:
+                    rectangles = []
+                    circles = []
+                    for obs in env.obstacles:
+                        if hasattr(obs, 'center'):  # Circle
+                            circles.append((
+                                obs.center[0], obs.center[1], obs.radius
+                            ))
+                        elif hasattr(obs, 'x_min'):  # Rectangle
+                            rectangles.append((
+                                obs.x_min, obs.x_max, obs.y_min, obs.y_max
+                            ))
+                    obstacles_data = (rectangles, circles)
+                
+                args_list = [
+                    (trajectories[k], self.bounds, robot_radius, obstacles_data)
+                    for k in range(self.n_samples)
+                ]
+                executor = self._get_pool()
+                # 使用executor.map进行并行检查
+                invalid_mask = np.array(list(executor.map(
+                    self._check_single_trajectory_validity, 
+                    args_list
+                )))
+            else:
+                # 串行碰撞检查（原始方式）
+                invalid_mask = np.zeros(self.n_samples, dtype=bool)
+                
+                for k in range(self.n_samples):
+                    traj = trajectories[k]
+                    
+                    # 1) 地图边界检查（考虑机器人半径）
+                    out_of_bounds = (
+                        (traj[:, 0] < x_min + robot_radius) |
+                        (traj[:, 0] > x_max - robot_radius) |
+                        (traj[:, 1] < y_min + robot_radius) |
+                        (traj[:, 1] > y_max - robot_radius)
+                    )
+                    if np.any(out_of_bounds):
+                        invalid_mask[k] = True
+                        continue
+                    
+                    # 2) 与障碍物的碰撞检查（包括段穿透）
+                    if self._check_trajectory_collision(traj):
+                        invalid_mask[k] = True
+            
+            # 只有在存在至少一条可行轨迹时才施加惩罚，
+            # 避免早期迭代全部不可行导致数值问题
+            if not np.all(invalid_mask):
+                costs = np.where(invalid_mask, costs + 1e6, costs)
+        
+        # 计算权重
+        weights = self.compute_weights(costs)
+        
+        # 更新控制点
+        self.update(sampled_control_points, weights)
+        
+        # 跟踪最佳代价
+        best_idx = np.argmin(costs)
+        best_cost = costs[best_idx]
+        self.cost_history.append(best_cost)
+        
+        # 获取最佳轨迹
+        best_trajectory = trajectories[best_idx]
+        
+        # 更新全局最佳（所有迭代中）
+        if best_cost < self.best_cost_all_time:
+            self.best_cost_all_time = best_cost
+            self.best_trajectory_all_time = best_trajectory.copy()
+            self.best_control_points_all_time = sampled_control_points[best_idx].copy()
+            self.best_iteration = self.iteration
+        
+        self.iteration += 1
+        
+        info = {
+            'iteration': self.iteration,
+            'best_cost': best_cost,
+            'mean_cost': np.mean(costs),
+            'best_trajectory': best_trajectory,
+            'all_trajectories': trajectories,
+            'weights': weights,
+            'control_points': self.control_points.copy(),
+            'best_cost_all_time': self.best_cost_all_time,
+            'best_iteration': self.best_iteration
+        }
+        
+        return info
+    
+    def optimize(self, start: np.ndarray, goal: np.ndarray,
+                n_iterations: int = 50,
+                verbose: bool = True,
+                return_best_all_time: bool = True) -> Dict:
+        """运行 MPPI 优化
+        Args:
+            start: 起始位置 (2,)
+            goal: 目标位置 (2,)
+            n_iterations: 迭代次数
+            verbose: 是否打印进度
+            return_best_all_time: 是否返回所有迭代中的最佳轨迹（推荐True）
+        Returns:
+            result: 包含优化结果的字典
+                - trajectory: 最终迭代的轨迹（或所有迭代中的最佳轨迹）
+                - best_trajectory_all_time: 所有迭代中的最佳轨迹
+                - best_cost_all_time: 所有迭代中的最佳代价
+                - best_iteration: 最佳轨迹所在的迭代
+        """
+        self.initialize(start, goal)
+        self.cost_history = []
+        self.iteration = 0
+        
+        # 初始化全局最佳跟踪
+        self.best_cost_all_time = np.inf
+        self.best_trajectory_all_time = None
+        self.best_control_points_all_time = None
+        self.best_iteration = -1
+        
+        info_history = []
+        
+        for i in range(n_iterations):
+            info = self.step()
+            info_history.append(info)
+            
+            if verbose and (i % 10 == 0 or i == n_iterations - 1):
+                global_best_str = f", 全局最佳 = {self.best_cost_all_time:.2f} (迭代 {self.best_iteration})" if self.best_iteration >= 0 else ""
+                print(f"迭代 {i}: 当前最佳代价 = {info['best_cost']:.2f}, "
+                      f"平均代价 = {info['mean_cost']:.2f}{global_best_str}")
+        
+        # 获取最终优化的轨迹（最后一次迭代）
+        final_trajectory = self.bspline.evaluate(
+            self.control_points,
+            n_samples=self.n_timesteps
+        )
+        
+        # 获取所有迭代中的最佳轨迹
+        if self.best_trajectory_all_time is not None:
+            best_trajectory_all_time = self.best_trajectory_all_time
+            best_control_points_all_time = self.best_control_points_all_time
+        else:
+            # 备用：如果未找到全局最佳，使用最终轨迹
+            best_trajectory_all_time = final_trajectory
+            best_control_points_all_time = self.control_points
+        
+        # 根据参数返回最佳轨迹或最终轨迹
+        if return_best_all_time:
+            output_trajectory = best_trajectory_all_time
+            output_control_points = best_control_points_all_time
+        else:
+            output_trajectory = final_trajectory
+            output_control_points = self.control_points
+        
+        result = {
+            'trajectory': output_trajectory,  # 最佳或最终（取决于 return_best_all_time）
+            'control_points': output_control_points,
+            'cost_history': np.array(self.cost_history),
+            'info_history': info_history,
+            # 关于所有迭代中最佳解的额外信息
+            'best_trajectory_all_time': best_trajectory_all_time,
+            'best_control_points_all_time': best_control_points_all_time,
+            'best_cost_all_time': self.best_cost_all_time,
+            'best_iteration': self.best_iteration,
+            'final_cost': self.cost_history[-1] if len(self.cost_history) > 0 else np.inf,
+            'final_trajectory': final_trajectory,
+            'final_control_points': self.control_points
+        }
+        
+        return result
+    
+    def get_current_trajectory(self) -> np.ndarray:
+        """从当前控制点获取轨迹
+        Returns:
+            trajectory: 形状 (n_timesteps, 2)
+        """
+        return self.bspline.evaluate(self.control_points, n_samples=self.n_timesteps)
