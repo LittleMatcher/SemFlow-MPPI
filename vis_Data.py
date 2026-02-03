@@ -5,7 +5,7 @@ from pathlib import Path
 
 from cfm_flowmp.utils.visualization import visualize_trajectory
 
-root = Path("traj_data") / "cfm_env"   # 换成 "cfm_env_rrt" 也可以
+root = Path("traj_data") / "cfm_env_hot"   # 换成 "cfm_env_rrt" 也可以
 data = np.load(root / "data.npz")
 
 positions = torch.from_numpy(data["positions"])       # [N, T, 2]
@@ -18,7 +18,7 @@ print("positions:", positions.shape)
 print("cost_maps:", cost_maps.shape)
 
 # 取第 idx 条样本
-idx = 11
+idx = 311
 pos = positions[idx]          # [T, 2]
 vel = velocities[idx]         # [T, 2]
 start_pos = start_states[idx, :2]

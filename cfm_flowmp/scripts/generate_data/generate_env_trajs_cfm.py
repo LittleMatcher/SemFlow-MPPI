@@ -765,6 +765,9 @@ def _generate_one_trajectory(traj_index: int, args_dict: Dict[str, Any]) -> Opti
                 dt=args_dict["mppi_dt"],
                 control_std=args_dict["mppi_control_std"],
                 temperature=args_dict["mppi_temperature"],
+                obstacle_scale=args_dict["mppi_obstacle_scale"],
+                goal_scale=args_dict["mppi_goal_scale"],
+                control_scale=args_dict["mppi_control_scale"],
                 rng=rng,
             )
         style = rng.dirichlet([1.0, 1.0]).astype(np.float32)
@@ -857,6 +860,12 @@ def main():
                         help="MPPI control perturbation std")
     parser.add_argument("--mppi_temperature", type=float, default=0.1,
                         help="MPPI temperature (lower = sharper weighting)")
+    parser.add_argument("--mppi_obstacle_scale", type=float, default=10.0,
+                        help="MPPI obstacle cost scale (positive=avoid high cost, negative=prefer high cost)")
+    parser.add_argument("--mppi_goal_scale", type=float, default=5.0,
+                        help="MPPI goal attraction scale")
+    parser.add_argument("--mppi_control_scale", type=float, default=0.1,
+                        help="MPPI control effort scale")
     # Kinodynamic RRT 参数（仅当 --planner rrt 时生效）
     parser.add_argument("--rrt_max_velocity", type=float, default=0.8,
                         help="RRT max velocity (normalized)")
@@ -913,6 +922,9 @@ def main():
         "mppi_dt": args.mppi_dt,
         "mppi_control_std": args.mppi_control_std,
         "mppi_temperature": args.mppi_temperature,
+        "mppi_obstacle_scale": args.mppi_obstacle_scale,
+        "mppi_goal_scale": args.mppi_goal_scale,
+        "mppi_control_scale": args.mppi_control_scale,
         "center_obstacles_only": center_only,
         "rrt_num_obstacles": getattr(args, "rrt_num_obstacles", 2),
         "rrt_max_velocity": getattr(args, "rrt_max_velocity", 0.8),
