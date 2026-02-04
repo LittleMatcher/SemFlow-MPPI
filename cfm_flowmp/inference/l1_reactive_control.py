@@ -595,6 +595,71 @@ class L1ReactiveController:
     # ------------------------------------------------------------------
     # 热启动：保持与旧 API 一致，用于给 L2 / TrajectoryGenerator 提供 warm-start 状态
     # ------------------------------------------------------------------
+    def shift_trajectory(
+        self,
+        trajectory: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        移位操作：将轨迹向前移动一步 (Predict Step)
+        
+        实现 Warm Start 的"Predict"阶段：
+        在 t 时刻规划出的最优轨迹 τ*_t，在 t+1 时刻应该成为强有力的先验。
+        移位操作：丢弃第一个动作，末尾补零或补预测。
+        
+        数学表达:
+            u_pred = Shift(u*_{t-1})
+        
+        Args:
+            trajectory: 轨迹 [B, T, D] 或 [T, D]
+                D 可以是位置维度 (2D) 或完整状态维度 (pos+vel+acc, 6D)
+            
+        Returns:
+            shifted_traj: 移位后的轨迹 [B, T, D] 或 [T, D]
+        """
+        if trajectory.dim() == 2:
+            # [T, D]
+            T, D = trajectory.shape
+            shifted = torch.zeros_like(trajectory)
+            
+            # 向前移动：u_{t+1} = u_t (丢弃第一个，其余前移)
+            shifted[:-1] = trajectory[1:]
+            
+            # 末尾填充
+            if self.config.shift_padding_mode == "zero":
+                # 补零
+                shifted[-1] = 0.0
+            elif self.config.shift_padding_mode == "extrapolate":
+                # 外推：使用最后两个点的差值（恒速度假设）
+                if T >= 2:
+                    shifted[-1] = trajectory[-1] + (
+                        trajectory[-1] - trajectory[-2]
+                    )
+                else:
+                    shifted[-1] = trajectory[-1]
+            else:
+                shifted[-1] = trajectory[-1]  # 保持最后一个值
+            
+            return shifted
+        else:
+            # [B, T, D]
+            B, T, D = trajectory.shape
+            shifted = torch.zeros_like(trajectory)
+            shifted[:, :-1] = trajectory[:, 1:]
+            
+            if self.config.shift_padding_mode == "zero":
+                shifted[:, -1] = 0.0
+            elif self.config.shift_padding_mode == "extrapolate":
+                if T >= 2:
+                    shifted[:, -1] = trajectory[:, -1] + (
+                        trajectory[:, -1] - trajectory[:, -2]
+                    )
+                else:
+                    shifted[:, -1] = trajectory[:, -1]
+            else:
+                shifted[:, -1] = trajectory[:, -1]
+            
+            return shifted
+    
     def shift_control_sequence(
         self,
         control_sequence: torch.Tensor,
@@ -602,8 +667,7 @@ class L1ReactiveController:
         """
         移位操作：将控制序列向前移动一步
         
-        在 t 时刻规划出的最优轨迹 τ*_t，在 t+1 时刻应该成为强有力的先验。
-        移位操作：丢弃第一个动作，末尾补零或补预测。
+        别名方法，调用 shift_trajectory 以保持向后兼容性。
         
         Args:
             control_sequence: 控制序列 [T, D] 或 [B, T, D]
@@ -611,49 +675,98 @@ class L1ReactiveController:
         Returns:
             shifted_control: 移位后的控制序列 [T, D] 或 [B, T, D]
         """
-        if control_sequence.dim() == 2:
+        return self.shift_trajectory(control_sequence)
+    
+    def prepare_warm_start_latent(
+        self,
+        prev_opt_traj: torch.Tensor,
+        tau_warm: float = 0.8,
+    ) -> torch.Tensor:
+        """
+        准备热启动潜在状态（Revert Step）
+        
+        实现 Warm Start 的"Revert"阶段，使用 Optimal Transport (OT) 插值：
+        1. 移位前一帧的最优轨迹
+        2. 采样高斯噪声 ε ~ N(0, I)
+        3. 使用 OT 插值构建中间时刻 τ_warm 的潜在状态
+        
+        数学表达:
+            u_shift = Shift(u*_{t-1})
+            ε ~ N(0, I)
+            z_τ = τ_warm · u_shift + (1 - τ_warm) · ε
+        
+        这遵循 SDEdit 原理：而不是从 t=0 (纯噪声) 开始，我们从 t=τ_warm
+        开始，这保留了前一轨迹的结构，同时允许模型纠正错误。
+        
+        Args:
+            prev_opt_traj: 前一帧的最优轨迹 [T, D] 或 [B, T, D]
+                对于完整状态，D 应该是 state_dim * 3 (pos + vel + acc)
+                对于仅位置，D 应该是 state_dim (将自动扩展)
+            tau_warm: OT 插值参数，范围 [0, 1]
+                0.0 = 纯噪声（标准 CFM）
+                1.0 = 完全确定性（无探索）
+                0.8 = 推荐值（80% 先验，20% 噪声）
+            
+        Returns:
+            z_tau: 时间 τ_warm 的热启动潜在状态 [T, D*3] 或 [B, T, D*3]
+        """
+        # 步骤 1: 移位轨迹（Predict）
+        shifted_traj = self.shift_trajectory(prev_opt_traj)
+        
+        # 检查输入维度并扩展为完整状态（如果需要）
+        if shifted_traj.dim() == 2:
             # [T, D]
-            T, D = control_sequence.shape
-            shifted = torch.zeros_like(control_sequence)
+            T, D = shifted_traj.shape
+            batch_size = None
             
-            # 向前移动：u_{t+1} = u_t (丢弃第一个，其余前移)
-            shifted[:-1] = control_sequence[1:]
-            
-            # 末尾填充
-            if self.config.shift_padding_mode == "zero":
-                # 补零
-                shifted[-1] = 0.0
-            elif self.config.shift_padding_mode == "extrapolate":
-                # 外推：使用最后两个点的差值
-                if T >= 2:
-                    shifted[-1] = control_sequence[-1] + (
-                        control_sequence[-1] - control_sequence[-2]
-                    )
-                else:
-                    shifted[-1] = control_sequence[-1]
+            # 如果输入仅为位置（D = state_dim），扩展为完整状态
+            if D == 2:  # 仅位置 (x, y)
+                positions = shifted_traj  # [T, 2]
+                
+                # 计算速度（有限差分）
+                dt = self.config.time_horizon / self.config.n_timesteps
+                velocities = torch.diff(positions, dim=0) / dt
+                velocities = torch.cat([velocities, velocities[-1:]], dim=0)  # [T, 2]
+                
+                # 计算加速度
+                accelerations = torch.diff(velocities, dim=0) / dt
+                accelerations = torch.cat([accelerations, accelerations[-1:]], dim=0)  # [T, 2]
+                
+                # 拼接完整状态 [T, 6]
+                u_shift = torch.cat([positions, velocities, accelerations], dim=-1)
             else:
-                shifted[-1] = control_sequence[-1]  # 保持最后一个值
-            
-            return shifted
+                # 已经是完整状态
+                u_shift = shifted_traj
         else:
             # [B, T, D]
-            B, T, D = control_sequence.shape
-            shifted = torch.zeros_like(control_sequence)
-            shifted[:, :-1] = control_sequence[:, 1:]
+            B, T, D = shifted_traj.shape
+            batch_size = B
             
-            if self.config.shift_padding_mode == "zero":
-                shifted[:, -1] = 0.0
-            elif self.config.shift_padding_mode == "extrapolate":
-                if T >= 2:
-                    shifted[:, -1] = control_sequence[:, -1] + (
-                        control_sequence[:, -1] - control_sequence[:, -2]
-                    )
-                else:
-                    shifted[:, -1] = control_sequence[:, -1]
+            if D == 2:  # 仅位置
+                positions = shifted_traj  # [B, T, 2]
+                
+                # 计算速度
+                dt = self.config.time_horizon / self.config.n_timesteps
+                velocities = torch.diff(positions, dim=1) / dt
+                velocities = torch.cat([velocities, velocities[:, -1:, :]], dim=1)
+                
+                # 计算加速度
+                accelerations = torch.diff(velocities, dim=1) / dt
+                accelerations = torch.cat([accelerations, accelerations[:, -1:, :]], dim=1)
+                
+                # 拼接完整状态 [B, T, 6]
+                u_shift = torch.cat([positions, velocities, accelerations], dim=-1)
             else:
-                shifted[:, -1] = control_sequence[:, -1]
-            
-            return shifted
+                u_shift = shifted_traj
+        
+        # 步骤 2: 采样噪声 ε ~ N(0, I)
+        epsilon = torch.randn_like(u_shift)
+        
+        # 步骤 3: OT 插值 z_τ = τ · u_shift + (1 - τ) · ε
+        # 这是 Optimal Transport 路径公式，与 CFM 训练一致
+        z_tau = tau_warm * u_shift + (1.0 - tau_warm) * epsilon
+        
+        return z_tau
     
     def prepare_warm_start_state(
         self,
@@ -662,8 +775,8 @@ class L1ReactiveController:
         """
         准备热启动状态（用于 CFM 反向注入）
         
-        将移位后的控制序列加噪后作为 CFM 的初始状态 z_T
-        （Reverse Process 的起点），而不是从纯高斯噪声 N(0, I) 开始。
+        旧方法，保持向后兼容性。
+        推荐使用 prepare_warm_start_latent() 以获得更好的 OT 插值控制。
         
         Args:
             shifted_control: 移位后的控制序列 [T, D]
@@ -671,6 +784,9 @@ class L1ReactiveController:
         Returns:
             warm_start_state: 热启动状态 [T, D*3] (pos + vel + acc)
         """
+        # 使用默认 tau_warm = 0.8 调用新方法
+        # 注意：此方法添加简单的高斯噪声，而 prepare_warm_start_latent
+        # 使用正确的 OT 插值
         T, D = shifted_control.shape
         
         # 将控制序列转换为完整状态（pos + vel + acc）

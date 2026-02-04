@@ -9,8 +9,9 @@ FlowMP 轨迹生成器
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List, Callable
 from dataclasses import dataclass
 
 from .ode_solver import RK4Solver, SolverConfig, create_solver
@@ -78,6 +79,119 @@ class GeneratorConfig:
 # 来自"统一生成-细化规划"的 8 步调度
 # 前载式：早期大步长（探索），后期小步长（细化）
 DEFAULT_8STEP_SCHEDULE = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
+
+
+def explicit_safety_filter(
+    x: torch.Tensor,
+    v_ref: torch.Tensor,
+    cost_map_fn: Callable[[torch.Tensor], torch.Tensor],
+    safety_threshold: float = 0.5,
+    alpha: float = 0.5,
+    epsilon: float = 1e-6,
+    damping_factor: float = 0.5,
+) -> torch.Tensor:
+    """
+    Explicit CBF Safety Filter for 2D Navigation
+    
+    Applies a closed-form safety filter derived from "Safe Flow Matching" (arXiv:2504.08661).
+    This corrects the reference velocity field to satisfy safety constraints.
+    
+    Mathematical Formulation:
+        Safety Barrier Function: h(x) = Threshold - C(x)
+        Safety Condition: dh/dt >= -alpha * h(x)  (Nagumo Theorem)
+        
+        Safe Velocity: v_safe = v_ref + lambda* * grad_h(x)
+        
+        Where lambda* = ReLU(-(grad_h^T @ v_ref + alpha * h)) / (||grad_h||^2 + eps)
+    
+    Args:
+        x: Current state tensor [B, State_Dim] or [B, T, State_Dim]
+            Position is assumed to be in the first 2 dimensions
+        v_ref: CFM predicted velocity [B, State_Dim] or [B, T, State_Dim]
+            Must have same shape as x
+        cost_map_fn: Callable that takes positions [B, 2] or [B, T, 2] and returns cost values [B, 1] or [B, T, 1]
+            Higher cost means more dangerous
+        safety_threshold: Safety threshold for h(x). h(x) >= 0 means safe
+        alpha: Safety decay rate (gamma in some literature). Higher = more conservative
+        epsilon: Numerical stability term for division
+        damping_factor: Factor to dampen higher-order derivatives (acceleration/jerk)
+            when velocity is corrected. Range [0, 1], where 0 = zero out, 1 = keep unchanged
+    
+    Returns:
+        v_safe: Safety-filtered velocity [same shape as v_ref]
+    
+    Physical Meaning:
+        If the safety margin (dh/dt + alpha*h) is negative (constraint violation),
+        project the velocity along the gradient of h just enough to satisfy the constraint.
+        Only the velocity components (first 2 dims) are modified; acceleration/jerk are dampened.
+    """
+    original_shape = x.shape
+    has_time_dim = (x.dim() == 3)
+    
+    # Flatten time dimension if present: [B, T, D] -> [B*T, D]
+    if has_time_dim:
+        B, T, D = x.shape
+        x = x.reshape(B * T, D)
+        v_ref = v_ref.reshape(B * T, D)
+    else:
+        D = x.shape[-1]
+    
+    # Extract positions (first 2 dimensions)
+    positions = x[:, :2].clone()
+    positions.requires_grad_(True)
+    
+    # Compute h(x) = threshold - C(x)
+    # cost_map_fn expects positions and returns cost values
+    cost_values = cost_map_fn(positions)  # [B*T, 1] or [B*T,]
+    
+    if cost_values.dim() == 1:
+        cost_values = cost_values.unsqueeze(-1)
+    
+    h_x = safety_threshold - cost_values  # [B*T, 1]
+    
+    # Compute gradient of h w.r.t positions: grad_h = -grad_C
+    # We need grad_h to point towards safer regions
+    grad_h = torch.autograd.grad(
+        outputs=h_x.sum(),
+        inputs=positions,
+        create_graph=False,  # For inference, we don't need higher-order gradients
+        retain_graph=False,
+    )[0]  # [B*T, 2]
+    
+    # Extract velocity components (first 2 dimensions of v_ref)
+    v_ref_velocity = v_ref[:, :2]  # [B*T, 2]
+    
+    # Compute safety margin: dh/dt + alpha * h
+    # dh/dt = grad_h^T @ v_ref
+    dh_dt = (grad_h * v_ref_velocity).sum(dim=-1, keepdim=True)  # [B*T, 1]
+    safety_margin = dh_dt + alpha * h_x  # [B*T, 1]
+    
+    # Compute projection scalar lambda*
+    # lambda* = ReLU(-safety_margin) / (||grad_h||^2 + eps)
+    grad_h_norm_sq = (grad_h ** 2).sum(dim=-1, keepdim=True)  # [B*T, 1]
+    lambda_star = torch.relu(-safety_margin) / (grad_h_norm_sq + epsilon)  # [B*T, 1]
+    
+    # Compute correction: delta_v = lambda* * grad_h
+    delta_v = lambda_star * grad_h  # [B*T, 2]
+    
+    # Apply correction to velocity components only
+    v_safe = v_ref.clone()
+    v_safe[:, :2] = v_ref_velocity + delta_v
+    
+    # Dampen higher-order derivatives (acceleration, jerk, etc.) if present
+    # This ensures physical consistency when velocity is corrected
+    if D > 2:
+        # Apply damping to acceleration (dims 2:4) and jerk (dims 4:6) if present
+        if D >= 4:
+            v_safe[:, 2:4] = v_ref[:, 2:4] * damping_factor
+        if D >= 6:
+            v_safe[:, 4:6] = v_ref[:, 4:6] * damping_factor
+    
+    # Reshape back to original shape if needed
+    if has_time_dim:
+        v_safe = v_safe.reshape(B, T, D)
+    
+    return v_safe
 
 
 class BSplineSmoother:
@@ -712,11 +826,15 @@ class MultimodalAnchorSelector:
         start_vel: Optional[torch.Tensor] = None,
         goal_vel: Optional[torch.Tensor] = None,
         env_encoding: Optional[torch.Tensor] = None,
+        cost_map: Optional[torch.Tensor] = None,
+        safety_threshold: float = 0.5,
+        cbf_alpha: Optional[float] = None,
     ):
         """
         为 ODE 求解器创建速度函数
         
-        速度函数包装模型并处理条件化。
+        速度函数包装模型并处理条件化。如果提供了 cost_map，
+        则应用显式 CBF 安全过滤器。
         
         参数:
             start_pos: 起始位置 [B, D]
@@ -724,7 +842,69 @@ class MultimodalAnchorSelector:
             start_vel: 起始速度 [B, D] (可选)
             goal_vel: 目标速度 [B, D] (可选，用于 L2 层)
             env_encoding: 环境编码 [B, env_dim] (可选，用于 L2 层)
+            cost_map: 语义代价图 [B, H, W] (可选，用于 CBF 安全过滤)
+            safety_threshold: CBF 安全阈值
+            cbf_alpha: CBF 衰减率 (如果为 None，则使用 self.config.cbf_alpha)
         """
+        # Use config alpha if not provided
+        if cbf_alpha is None:
+            cbf_alpha = self.config.cbf_alpha
+        
+        # Create cost map query function if cost_map is provided
+        cost_map_fn = None
+        if cost_map is not None:
+            # Store cost map info for closure
+            B_map, H_map, W_map = cost_map.shape
+            device = cost_map.device
+            dtype = cost_map.dtype
+            
+            # Normalize cost map to [0, 1] if not already
+            cost_map_normalized = cost_map.clone()
+            cost_min = cost_map_normalized.min()
+            cost_max = cost_map_normalized.max()
+            if cost_max > cost_min:
+                cost_map_normalized = (cost_map_normalized - cost_min) / (cost_max - cost_min)
+            
+            def cost_map_fn(positions: torch.Tensor) -> torch.Tensor:
+                """
+                Query cost map at given positions using bilinear interpolation.
+                
+                Args:
+                    positions: [N, 2] positions in world coordinates
+                    
+                Returns:
+                    costs: [N, 1] interpolated cost values
+                """
+                N = positions.shape[0]
+                
+                # Normalize positions to [-1, 1] for grid_sample
+                # Assume positions are in range [0, H_map] x [0, W_map]
+                # Adjust this normalization based on your coordinate system
+                pos_normalized = positions.clone()
+                pos_normalized[:, 0] = (pos_normalized[:, 0] / W_map) * 2 - 1  # x -> [-1, 1]
+                pos_normalized[:, 1] = (pos_normalized[:, 1] / H_map) * 2 - 1  # y -> [-1, 1]
+                
+                # Reshape for grid_sample: [1, H, W] and [1, N, 1, 2]
+                grid = pos_normalized.view(1, N, 1, 2)  # [1, N, 1, 2]
+                
+                # Expand cost_map if batch size doesn't match
+                # For simplicity, use the first cost map in batch
+                cost_map_query = cost_map_normalized[0:1].unsqueeze(0)  # [1, 1, H, W]
+                
+                # Sample using bilinear interpolation
+                sampled = F.grid_sample(
+                    cost_map_query,
+                    grid,
+                    mode='bilinear',
+                    padding_mode='border',
+                    align_corners=True
+                )  # [1, 1, N, 1]
+                
+                # Reshape to [N, 1]
+                costs = sampled.squeeze(0).squeeze(-1).transpose(0, 1)  # [N, 1]
+                
+                return costs
+        
         def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             """
             计算状态 x_t 和时间 t 处的速度
@@ -736,10 +916,11 @@ class MultimodalAnchorSelector:
             返回:
                 速度场 [B, T, 6]
             """
+            # Get reference velocity from model
             with torch.no_grad():
                 # 调用模型（所有参数都是可选的，模型 forward 方法会处理）
                 # FlowMPTransformer 和 FlowMPUNet1D 都支持这些可选参数
-                output = self.model(
+                v_ref = self.model(
                     x_t=x_t,
                     t=t,
                     start_pos=start_pos,
@@ -748,7 +929,21 @@ class MultimodalAnchorSelector:
                     goal_vel=goal_vel,
                     env_encoding=env_encoding,
                 )
-            return output
+            
+            # Apply explicit safety filter if cost map is provided
+            if cost_map_fn is not None:
+                v_safe = explicit_safety_filter(
+                    x=x_t,
+                    v_ref=v_ref,
+                    cost_map_fn=cost_map_fn,
+                    safety_threshold=safety_threshold,
+                    alpha=cbf_alpha,
+                    epsilon=1e-6,
+                    damping_factor=0.5,
+                )
+                return v_safe
+            else:
+                return v_ref
         
         return velocity_fn
     
@@ -860,9 +1055,16 @@ class MultimodalAnchorSelector:
             # 状态有 6 个通道: 位置(2) + 速度(2) + 加速度(2)
             x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
         
-        # 创建速度函数（支持 L2 层的额外参数）
+        # 创建速度函数（支持 L2 层的额外参数和 CBF 安全过滤）
         velocity_fn = self._create_velocity_fn(
-            start_pos, goal_pos, start_vel, goal_vel, env_encoding
+            start_pos=start_pos,
+            goal_pos=goal_pos,
+            start_vel=start_vel,
+            goal_vel=goal_vel,
+            env_encoding=env_encoding,
+            cost_map=cost_map,
+            safety_threshold=self.config.cbf_margin,
+            cbf_alpha=self.config.cbf_alpha,
         )
         
         # 创建 CBF 引导函数（如果启用）
@@ -952,6 +1154,200 @@ class MultimodalAnchorSelector:
         # Update warm start cache (if enabled)
         if self.config.enable_warm_start and x_1 is not None:
             self.update_warm_start_cache({'raw_output': x_1})
+        
+        return result
+    
+    @torch.no_grad()
+    def generate_with_warm_start(
+        self,
+        condition: Dict[str, torch.Tensor],
+        warm_start_latent: torch.Tensor,
+        t_start: float = 0.8,
+        steps: int = 5,
+        cost_map: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        使用热启动潜在状态生成轨迹 (Refine Step)
+        
+        实现 Warm Start 的"Refine"阶段：
+        从中间时刻 t=τ_warm 开始部分 ODE 积分，而不是从 t=0 开始。
+        这显著减少计算成本（约 80%）并确保时间一致性。
+        
+        数学表达:
+            z_τ: 来自 L1 的热启动潜在状态（通过 OT 插值）
+            u_new = z_τ + ∫_{τ_warm}^{1} v_θ(z_s, s, c) ds
+        
+        这遵循 MPC 原理：优化建立在前一解的基础上，确保平滑的
+        时间演化并减少计算负担。
+        
+        Args:
+            condition: 条件字典，包含：
+                - 'start_pos': 起始位置 [B, D] 或 [D]
+                - 'goal_pos': 目标位置 [B, D] 或 [D]
+                - 'start_vel': 起始速度 [B, D] 或 [D] (可选)
+                - 'goal_vel': 目标速度 [B, D] 或 [D] (可选，用于 L2)
+                - 'env_encoding': 环境编码 [B, env_dim] (可选，用于 L2)
+            warm_start_latent: 时间 t_start 的热启动潜在状态 [B, T, D*3]
+                来自 L1Controller.prepare_warm_start_latent()
+            t_start: 开始积分的时间（例如 0.8）
+                必须在 [0, 1] 范围内，< 1.0
+            steps: 从 t_start 到 1.0 的 ODE 步数
+                较少的步数 = 更快但精度较低
+                推荐：5-10 步对于 t_start=0.8
+            cost_map: 语义代价图 [B, H, W] (可选，用于 CBF 安全过滤)
+            
+        Returns:
+            包含以下内容的字典：
+                - 'positions': 生成的位置轨迹 [B, T, D]
+                - 'velocities': 生成的速度轨迹 [B, T, D]
+                - 'accelerations': 生成的加速度轨迹 [B, T, D]
+                - 'raw_output': 原始模型输出 [B, T, D*3]
+                
+        示例用法:
+            # 在 t=0，正常生成
+            result_0 = generator.generate(start_pos, goal_pos)
+            
+            # L1 MPPI 优化 -> 获得 u*_0
+            optimal_traj = l1_controller.optimize(result_0)
+            
+            # 在 t=1，使用热启动
+            z_tau = l1_controller.prepare_warm_start_latent(
+                optimal_traj, tau_warm=0.8
+            )
+            result_1 = generator.generate_with_warm_start(
+                condition={'start_pos': new_start, 'goal_pos': new_goal},
+                warm_start_latent=z_tau,
+                t_start=0.8,
+                steps=5
+            )
+        """
+        self.model.eval()
+        
+        # 验证参数
+        if not (0.0 <= t_start < 1.0):
+            raise ValueError(f"t_start 必须在 [0, 1) 范围内，得到 {t_start}")
+        
+        if steps < 1:
+            raise ValueError(f"steps 必须 >= 1，得到 {steps}")
+        
+        # 提取条件
+        start_pos = condition['start_pos']
+        goal_pos = condition['goal_pos']
+        start_vel = condition.get('start_vel', None)
+        goal_vel = condition.get('goal_vel', None)
+        env_encoding = condition.get('env_encoding', None)
+        
+        # 确保条件具有批次维度
+        if start_pos.dim() == 1:
+            start_pos = start_pos.unsqueeze(0)
+        if goal_pos.dim() == 1:
+            goal_pos = goal_pos.unsqueeze(0)
+        if start_vel is not None and start_vel.dim() == 1:
+            start_vel = start_vel.unsqueeze(0)
+        if goal_vel is not None and goal_vel.dim() == 1:
+            goal_vel = goal_vel.unsqueeze(0)
+        
+        # 验证 warm_start_latent 形状
+        if warm_start_latent.dim() == 2:
+            # [T, D*3] -> [1, T, D*3]
+            warm_start_latent = warm_start_latent.unsqueeze(0)
+        
+        B_latent, T, D_full = warm_start_latent.shape
+        B_cond = start_pos.shape[0]
+        D = self.config.state_dim
+        
+        if D_full != D * 3:
+            raise ValueError(
+                f"warm_start_latent 必须具有形状 [*, T, {D*3}]，"
+                f"得到 [*, T, {D_full}]"
+            )
+        
+        if T != self.config.seq_len:
+            raise ValueError(
+                f"warm_start_latent 时间步数 {T} 不匹配 "
+                f"config.seq_len {self.config.seq_len}"
+            )
+        
+        # 广播批次大小
+        if B_latent == 1 and B_cond > 1:
+            warm_start_latent = warm_start_latent.repeat(B_cond, 1, 1)
+            B = B_cond
+        elif B_latent == B_cond:
+            B = B_cond
+        elif B_cond == 1 and B_latent > 1:
+            # 重复条件以匹配潜在批次
+            start_pos = start_pos.repeat(B_latent, 1)
+            goal_pos = goal_pos.repeat(B_latent, 1)
+            if start_vel is not None:
+                start_vel = start_vel.repeat(B_latent, 1)
+            if goal_vel is not None:
+                goal_vel = goal_vel.repeat(B_latent, 1)
+            if env_encoding is not None:
+                env_encoding = env_encoding.repeat(B_latent, 1)
+            B = B_latent
+        else:
+            raise ValueError(
+                f"批次大小不兼容：warm_start_latent {B_latent} vs 条件 {B_cond}"
+            )
+        
+        device = warm_start_latent.device
+        dtype = warm_start_latent.dtype
+        
+        # 创建速度函数（支持 L2 额外参数和 CBF 安全过滤）
+        velocity_fn = self._create_velocity_fn(
+            start_pos=start_pos,
+            goal_pos=goal_pos,
+            start_vel=start_vel,
+            goal_vel=goal_vel,
+            env_encoding=env_encoding,
+            cost_map=cost_map,
+            safety_threshold=self.config.cbf_margin,
+            cbf_alpha=self.config.cbf_alpha,
+        )
+        
+        # 创建从 t_start 到 1.0 的部分时间调度
+        t_span = torch.linspace(
+            t_start, 1.0, steps + 1, 
+            device=device, dtype=dtype
+        ).tolist()
+        
+        # 使用部分时间跨度求解 ODE
+        # 关键点：我们从 z_tau (warm_start_latent) 开始，
+        # 并仅积分从 t_start 到 1.0
+        x_1 = self.solver.solve(
+            velocity_fn=velocity_fn,
+            x_0=warm_start_latent,
+            time_schedule=t_span,
+        )
+        
+        # 提取组件
+        positions_raw = x_1[..., :D]
+        velocities_raw = x_1[..., D:D*2]
+        accelerations_raw = x_1[..., D*2:D*3]
+        
+        result = {}
+        
+        # 如果启用则应用平滑
+        if self.smoother is not None:
+            smoothed = self.smoother.smooth(positions_raw, return_derivatives=True)
+            result['positions'] = smoothed['positions']
+            result['velocities'] = smoothed['velocities']
+            result['accelerations'] = smoothed['accelerations']
+        else:
+            result['positions'] = positions_raw
+            result['velocities'] = velocities_raw
+            result['accelerations'] = accelerations_raw
+        
+        # 包含原始输出
+        result['raw_output'] = x_1
+        result['raw_positions'] = positions_raw
+        result['raw_velocities'] = velocities_raw
+        result['raw_accelerations'] = accelerations_raw
+        
+        # 包含元数据
+        result['t_start'] = t_start
+        result['steps'] = steps
+        result['warm_start'] = True
         
         return result
     

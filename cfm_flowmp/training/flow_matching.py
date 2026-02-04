@@ -9,6 +9,19 @@
 参考: FlowMP 论文中条件概率路径的公式。
 """
 
+"""
+CBF Implementation Notes:
+========================
+
+This file contains TRAINING-TIME CBF implementations:
+- CBFConstraintLoss: Loss function for training
+- compute_cbf_guidance: Guidance for ODE solving during training
+
+For INFERENCE-TIME explicit safety filtering, see:
+- cfm_flowmp/inference/generator.py::explicit_safety_filter()
+  (Based on "Safe Flow Matching" closed-form QP solution)
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

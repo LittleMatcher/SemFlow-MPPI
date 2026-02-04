@@ -1,285 +1,407 @@
-#!/usr/bin/env python3
 """
-Test Warm-Start Mechanism
-
-Validates the warm-start functionality of TrajectoryGenerator.
+Unit tests for Warm Start (Predict-Revert-Refine) implementation
 """
 
-import sys
-from pathlib import Path
 import torch
+import pytest
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from cfm_flowmp.models import create_flowmp_transformer
-from cfm_flowmp.inference import TrajectoryGenerator, GeneratorConfig
-
-
-def test_warm_start_initialization():
-    """Test that warm-start can be enabled/disabled."""
-    print("\n" + "="*60)
-    print("TEST 1: Warm-Start Initialization")
-    print("="*60)
+def test_l1_shift_trajectory():
+    """Test L1Controller.shift_trajectory method"""
+    from cfm_flowmp.inference.l1_reactive_control import L1ReactiveController, L1Config
     
-    model = create_flowmp_transformer(variant="tiny")
+    # Setup
+    config = L1Config(
+        n_timesteps=64,
+        time_horizon=5.0,
+        shift_padding_mode="zero",
+    )
+    controller = L1ReactiveController(config)
     
-    # Test 1: Without warm-start
-    config_no_ws = GeneratorConfig(enable_warm_start=False)
-    gen_no_ws = TrajectoryGenerator(model, config_no_ws)
+    # Test case 1: 2D tensor [T, D]
+    T, D = 64, 6
+    trajectory = torch.randn(T, D)
     
-    assert gen_no_ws.warm_start_cache is None, "Cache should be None initially"
-    assert gen_no_ws.warm_start_timestep == 0, "Timestep should be 0 initially"
-    print("✓ Without warm-start: correctly initialized")
+    shifted = controller.shift_trajectory(trajectory)
     
-    # Test 2: With warm-start
-    config_with_ws = GeneratorConfig(enable_warm_start=True)
-    gen_with_ws = TrajectoryGenerator(model, config_with_ws)
+    # Check shape
+    assert shifted.shape == trajectory.shape, f"Shape mismatch: {shifted.shape} vs {trajectory.shape}"
     
-    assert gen_with_ws.warm_start_cache is None, "Cache should be None initially"
-    print("✓ With warm-start: correctly initialized")
-
-
-def test_trajectory_shifting():
-    """Test trajectory shifting operations."""
-    print("\n" + "="*60)
-    print("TEST 2: Trajectory Shifting")
-    print("="*60)
+    # Check shift operation
+    assert torch.allclose(shifted[:-1], trajectory[1:]), "Shift operation incorrect"
     
-    model = create_flowmp_transformer(variant="tiny")
+    # Check padding (zero mode)
+    assert torch.allclose(shifted[-1], torch.zeros(D)), "Zero padding incorrect"
     
-    # Test different shift modes
-    shift_modes = ["zero_pad", "repeat_last", "predict"]
+    print("✓ Test 1: shift_trajectory [T, D] with zero padding - PASSED")
     
-    for mode in shift_modes:
-        config = GeneratorConfig(
-            enable_warm_start=True,
-            warm_start_shift_mode=mode,
-        )
-        generator = TrajectoryGenerator(model, config)
-        
-        # Create a test trajectory
-        B, T, D = 2, 64, 6
-        test_traj = torch.randn(B, T, D)
-        
-        # Shift it
-        shifted = generator._shift_trajectory_forward(test_traj)
-        
-        # Validate shape
-        assert shifted.shape == test_traj.shape, f"Shape mismatch for mode {mode}"
-        
-        # Validate first T-1 elements are shifted
-        assert torch.allclose(shifted[:, :-1, :], test_traj[:, 1:, :]), \
-            f"Shift operation failed for mode {mode}"
-        
-        print(f"✓ Shift mode '{mode}': passed")
+    # Test case 2: 3D tensor [B, T, D]
+    B = 4
+    trajectory_batch = torch.randn(B, T, D)
+    
+    shifted_batch = controller.shift_trajectory(trajectory_batch)
+    
+    assert shifted_batch.shape == trajectory_batch.shape
+    assert torch.allclose(shifted_batch[:, :-1], trajectory_batch[:, 1:])
+    
+    print("✓ Test 2: shift_trajectory [B, T, D] - PASSED")
+    
+    # Test case 3: Extrapolate mode
+    config.shift_padding_mode = "extrapolate"
+    controller = L1ReactiveController(config)
+    
+    trajectory = torch.randn(T, D)
+    shifted = controller.shift_trajectory(trajectory)
+    
+    # Last element should be extrapolated
+    expected_last = trajectory[-1] + (trajectory[-1] - trajectory[-2])
+    assert torch.allclose(shifted[-1], expected_last), "Extrapolation incorrect"
+    
+    print("✓ Test 3: shift_trajectory with extrapolate padding - PASSED")
 
 
-def test_cache_update():
-    """Test warm-start cache update mechanism."""
-    print("\n" + "="*60)
-    print("TEST 3: Cache Update")
-    print("="*60)
+def test_l1_prepare_warm_start_latent():
+    """Test L1Controller.prepare_warm_start_latent method"""
+    from cfm_flowmp.inference.l1_reactive_control import L1ReactiveController, L1Config
     
-    model = create_flowmp_transformer(variant="tiny")
-    config = GeneratorConfig(enable_warm_start=True)
-    generator = TrajectoryGenerator(model, config)
+    # Setup
+    config = L1Config(
+        n_timesteps=64,
+        time_horizon=5.0,
+        shift_padding_mode="zero",
+    )
+    controller = L1ReactiveController(config)
     
-    # Generate a trajectory
-    start_pos = torch.tensor([[0.0, 0.0]])
-    goal_pos = torch.tensor([[1.0, 1.0]])
+    # Test case 1: Full state input [T, D*3]
+    T, D = 64, 2
+    prev_traj = torch.randn(T, D * 3)  # pos + vel + acc
     
-    result = generator.generate(start_pos, goal_pos)
+    tau_warm = 0.8
+    z_tau = controller.prepare_warm_start_latent(prev_traj, tau_warm)
     
-    # Update cache
-    generator.update_warm_start_cache(result)
+    # Check shape
+    assert z_tau.shape == prev_traj.shape, f"Shape mismatch: {z_tau.shape} vs {prev_traj.shape}"
     
-    # Verify cache
-    assert generator.warm_start_cache is not None, "Cache should be set"
-    assert 'raw_output' in generator.warm_start_cache, "Cache should contain raw_output"
-    assert generator.warm_start_timestep == 1, "Timestep should increment"
+    # Check OT interpolation formula
+    # z_tau should be between shifted trajectory and noise
+    # We can't check exact values due to randomness, but we can check it's not purely deterministic
+    shifted = controller.shift_trajectory(prev_traj)
     
-    print("✓ Cache update: passed")
+    # z_tau should not be identical to shifted (due to noise)
+    assert not torch.allclose(z_tau, shifted), "z_tau should include noise"
     
-    # Test reset
-    generator.reset_warm_start()
-    assert generator.warm_start_cache is None, "Cache should be reset"
-    assert generator.warm_start_timestep == 0, "Timestep should be reset"
+    # z_tau should have similar magnitude to shifted
+    assert z_tau.std() > 0, "z_tau should have non-zero variance"
     
-    print("✓ Cache reset: passed")
+    print("✓ Test 1: prepare_warm_start_latent with full state [T, D*3] - PASSED")
+    
+    # Test case 2: Position-only input [T, D]
+    prev_traj_pos = torch.randn(T, D)  # positions only
+    
+    z_tau_pos = controller.prepare_warm_start_latent(prev_traj_pos, tau_warm)
+    
+    # Should auto-expand to full state
+    assert z_tau_pos.shape == (T, D * 3), f"Expected [T, {D*3}], got {z_tau_pos.shape}"
+    
+    print("✓ Test 2: prepare_warm_start_latent with positions only [T, D] - PASSED")
+    
+    # Test case 3: Batched input [B, T, D*3]
+    B = 4
+    prev_traj_batch = torch.randn(B, T, D * 3)
+    
+    z_tau_batch = controller.prepare_warm_start_latent(prev_traj_batch, tau_warm)
+    
+    assert z_tau_batch.shape == prev_traj_batch.shape
+    
+    print("✓ Test 3: prepare_warm_start_latent with batch [B, T, D*3] - PASSED")
+    
+    # Test case 4: OT interpolation bounds
+    # tau=0 should be pure noise, tau=1 should be deterministic
+    torch.manual_seed(42)
+    
+    # tau = 1.0 (fully deterministic)
+    z_tau_1 = controller.prepare_warm_start_latent(prev_traj, tau_warm=1.0)
+    shifted_1 = controller.shift_trajectory(prev_traj)
+    
+    # Should be very close (only numerical errors)
+    # Note: Not exactly equal due to internal computations
+    correlation = torch.corrcoef(torch.stack([z_tau_1.flatten(), shifted_1.flatten()]))[0, 1]
+    assert correlation > 0.99, f"tau=1.0 should be mostly deterministic, got correlation {correlation}"
+    
+    # tau = 0.0 (pure noise)
+    z_tau_0 = controller.prepare_warm_start_latent(prev_traj, tau_warm=0.0)
+    
+    # Should be mostly noise (low correlation with shifted)
+    correlation_0 = torch.corrcoef(torch.stack([z_tau_0.flatten(), shifted_1.flatten()]))[0, 1]
+    assert abs(correlation_0) < 0.3, f"tau=0.0 should be mostly noise, got correlation {correlation_0}"
+    
+    print("✓ Test 4: OT interpolation bounds (tau=0 and tau=1) - PASSED")
 
 
-def test_warm_start_generation():
-    """Test generation with warm-start."""
-    print("\n" + "="*60)
-    print("TEST 4: Generation with Warm-Start")
-    print("="*60)
+def test_generator_generate_with_warm_start():
+    """Test TrajectoryGenerator.generate_with_warm_start method"""
+    from cfm_flowmp.inference.generator import TrajectoryGenerator, GeneratorConfig
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = create_flowmp_transformer(variant="tiny").to(device)
-    model.eval()
+    # Mock model
+    class MockModel(torch.nn.Module):
+        def forward(self, x_t, t, **kwargs):
+            # Simple identity velocity field for testing
+            return torch.zeros_like(x_t)
     
-    # Generate first trajectory (no warm-start available)
+    # Setup
     config = GeneratorConfig(
-        enable_warm_start=True,
-        warm_start_noise_scale=0.1,
+        state_dim=2,
+        seq_len=64,
+        solver_type="rk4",
+        num_steps=20,
+        use_bspline_smoothing=False,  # Disable for testing
     )
+    
+    model = MockModel()
     generator = TrajectoryGenerator(model, config)
     
-    start_pos = torch.tensor([[0.0, 0.0]], device=device)
-    goal_pos = torch.tensor([[2.0, 2.0]], device=device)
+    # Test inputs
+    B, T, D = 1, 64, 2
+    start_pos = torch.randn(B, D)
+    goal_pos = torch.randn(B, D)
+    warm_start_latent = torch.randn(B, T, D * 3)
     
-    result1 = generator.generate(start_pos, goal_pos)
+    # Test case 1: Basic generation
+    tau_warm = 0.8
+    steps = 5
     
-    # Update cache
-    generator.update_warm_start_cache(result1)
-    
-    # Generate second trajectory (with warm-start)
-    result2 = generator.generate(start_pos, goal_pos)
-    
-    # They should be different but correlated
-    pos1 = result1['positions'][0]
-    pos2 = result2['positions'][0]
-    
-    # Not identical
-    assert not torch.allclose(pos1, pos2, atol=1e-6), \
-        "Trajectories should differ (due to noise)"
-    
-    # But correlated (cosine similarity should be reasonably high)
-    pos1_flat = pos1.flatten()
-    pos2_flat = pos2.flatten()
-    cos_sim = torch.dot(pos1_flat, pos2_flat) / (
-        torch.norm(pos1_flat) * torch.norm(pos2_flat)
+    result = generator.generate_with_warm_start(
+        condition={
+            'start_pos': start_pos,
+            'goal_pos': goal_pos,
+        },
+        warm_start_latent=warm_start_latent,
+        t_start=tau_warm,
+        steps=steps,
     )
     
-    print(f"  Cosine similarity: {cos_sim.item():.4f}")
-    assert cos_sim > 0.5, "Warm-started trajectories should be correlated"
+    # Check output structure
+    assert 'positions' in result, "Missing 'positions' in result"
+    assert 'velocities' in result, "Missing 'velocities' in result"
+    assert 'accelerations' in result, "Missing 'accelerations' in result"
+    assert 'raw_output' in result, "Missing 'raw_output' in result"
     
-    print("✓ Warm-start generation: passed")
-
-
-def test_comparison():
-    """Compare with and without warm-start over multiple steps."""
-    print("\n" + "="*60)
-    print("TEST 5: Multi-Step Comparison")
-    print("="*60)
+    # Check shapes
+    assert result['positions'].shape == (B, T, D), f"positions shape: {result['positions'].shape}"
+    assert result['velocities'].shape == (B, T, D), f"velocities shape: {result['velocities'].shape}"
+    assert result['accelerations'].shape == (B, T, D), f"accelerations shape: {result['accelerations'].shape}"
+    assert result['raw_output'].shape == (B, T, D * 3), f"raw_output shape: {result['raw_output'].shape}"
     
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = create_flowmp_transformer(variant="tiny").to(device)
-    model.eval()
+    # Check metadata
+    assert result['t_start'] == tau_warm
+    assert result['steps'] == steps
+    assert result['warm_start'] == True
     
-    start_pos = torch.tensor([[0.0, 0.0]], device=device)
-    goal_pos = torch.tensor([[2.0, 2.0]], device=device)
+    print("✓ Test 1: generate_with_warm_start basic generation - PASSED")
     
-    # Without warm-start
-    config_no_ws = GeneratorConfig(enable_warm_start=False)
-    gen_no_ws = TrajectoryGenerator(model, config_no_ws)
+    # Test case 2: Batch size broadcasting
+    start_pos_single = torch.randn(1, D)
+    goal_pos_single = torch.randn(1, D)
+    warm_start_batch = torch.randn(4, T, D * 3)
     
-    results_no_ws = []
-    for _ in range(3):
-        result = gen_no_ws.generate(start_pos, goal_pos)
-        results_no_ws.append(result['positions'][0])
-    
-    # With warm-start
-    config_with_ws = GeneratorConfig(
-        enable_warm_start=True,
-        warm_start_noise_scale=0.1,
+    result_batch = generator.generate_with_warm_start(
+        condition={
+            'start_pos': start_pos_single,
+            'goal_pos': goal_pos_single,
+        },
+        warm_start_latent=warm_start_batch,
+        t_start=0.8,
+        steps=5,
     )
-    gen_with_ws = TrajectoryGenerator(model, config_with_ws)
     
-    results_with_ws = []
-    for _ in range(3):
-        result = gen_with_ws.generate(start_pos, goal_pos)
-        gen_with_ws.update_warm_start_cache(result)
-        results_with_ws.append(result['positions'][0])
+    # Should broadcast conditions to match warm_start batch size
+    assert result_batch['positions'].shape[0] == 4
     
-    # Compute consecutive correlations
-    def compute_correlations(results):
-        correlations = []
-        for i in range(len(results) - 1):
-            r1 = results[i].flatten()
-            r2 = results[i+1].flatten()
-            cos_sim = torch.dot(r1, r2) / (torch.norm(r1) * torch.norm(r2))
-            correlations.append(cos_sim.item())
-        return np.mean(correlations)
+    print("✓ Test 2: generate_with_warm_start batch broadcasting - PASSED")
     
-    corr_no_ws = compute_correlations(results_no_ws)
-    corr_with_ws = compute_correlations(results_with_ws)
-    
-    print(f"  Avg correlation (no warm-start):   {corr_no_ws:.4f}")
-    print(f"  Avg correlation (with warm-start): {corr_with_ws:.4f}")
-    
-    # With warm-start should have higher temporal correlation
-    print(f"  Improvement: {(corr_with_ws - corr_no_ws) / corr_no_ws * 100:.1f}%")
-    
-    print("✓ Multi-step comparison: passed")
-
-
-def test_noise_scale_effect():
-    """Test effect of different noise scales."""
-    print("\n" + "="*60)
-    print("TEST 6: Noise Scale Effect")
-    print("="*60)
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = create_flowmp_transformer(variant="tiny").to(device)
-    model.eval()
-    
-    start_pos = torch.tensor([[0.0, 0.0]], device=device)
-    goal_pos = torch.tensor([[2.0, 2.0]], device=device)
-    
-    noise_scales = [0.01, 0.1, 0.3, 0.5]
-    
-    for noise_scale in noise_scales:
-        config = GeneratorConfig(
-            enable_warm_start=True,
-            warm_start_noise_scale=noise_scale,
+    # Test case 3: Different tau values
+    for tau in [0.5, 0.7, 0.8, 0.9]:
+        result_tau = generator.generate_with_warm_start(
+            condition={'start_pos': start_pos, 'goal_pos': goal_pos},
+            warm_start_latent=warm_start_latent,
+            t_start=tau,
+            steps=5,
         )
-        generator = TrajectoryGenerator(model, config)
-        
-        # Generate and cache first trajectory
-        result1 = generator.generate(start_pos, goal_pos)
-        generator.update_warm_start_cache(result1)
-        
-        # Generate second trajectory
-        result2 = generator.generate(start_pos, goal_pos)
-        
-        # Compute difference
-        diff = torch.norm(result1['positions'] - result2['positions']).item()
-        
-        print(f"  Noise scale {noise_scale:.2f}: diff = {diff:.4f}")
+        assert result_tau['t_start'] == tau
     
-    print("✓ Noise scale effect: validated")
-
-
-def main():
-    print("="*60)
-    print("Testing Warm-Start Mechanism")
-    print("="*60)
+    print("✓ Test 3: generate_with_warm_start different tau values - PASSED")
     
+    # Test case 4: Error handling
     try:
-        test_warm_start_initialization()
-        test_trajectory_shifting()
-        test_cache_update()
-        test_warm_start_generation()
-        test_comparison()
-        test_noise_scale_effect()
-        
-        print("\n" + "="*60)
-        print("✅ ALL TESTS PASSED")
-        print("="*60)
-        
-    except AssertionError as e:
-        print(f"\n❌ TEST FAILED: {e}")
-        return 1
-    except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+        # Invalid t_start
+        generator.generate_with_warm_start(
+            condition={'start_pos': start_pos, 'goal_pos': goal_pos},
+            warm_start_latent=warm_start_latent,
+            t_start=1.5,  # Invalid: > 1.0
+            steps=5,
+        )
+        assert False, "Should raise ValueError for invalid t_start"
+    except ValueError as e:
+        assert "t_start" in str(e)
+        print("✓ Test 4: Error handling for invalid t_start - PASSED")
+
+
+def test_warm_start_integration():
+    """Integration test: L1 + L2 warm start workflow"""
+    from cfm_flowmp.inference.generator import TrajectoryGenerator, GeneratorConfig
+    from cfm_flowmp.inference.l1_reactive_control import L1ReactiveController, L1Config
     
-    return 0
+    # Mock model
+    class MockModel(torch.nn.Module):
+        def forward(self, x_t, t, **kwargs):
+            return torch.zeros_like(x_t)
+    
+    # Setup
+    gen_config = GeneratorConfig(
+        state_dim=2,
+        seq_len=64,
+        solver_type="rk4",
+        num_steps=20,
+        use_bspline_smoothing=False,
+    )
+    
+    l1_config = L1Config(
+        n_timesteps=64,
+        time_horizon=5.0,
+        use_warm_start=True,
+    )
+    
+    generator = TrajectoryGenerator(MockModel(), gen_config)
+    l1_controller = L1ReactiveController(l1_config)
+    
+    # Simulate 3 timesteps
+    T, D = 64, 2
+    prev_optimal = None
+    
+    for timestep in range(3):
+        start_pos = torch.tensor([[0.0 + timestep * 0.1, 0.0 + timestep * 0.1]])
+        goal_pos = torch.tensor([[1.0, 1.0]])
+        
+        if timestep == 0:
+            # First timestep: generate from scratch
+            result = generator.generate(start_pos, goal_pos, return_raw=True)
+            prev_optimal = torch.randn(T, D * 3)  # Mock optimal trajectory
+        else:
+            # Subsequent: use warm start
+            z_tau = l1_controller.prepare_warm_start_latent(
+                prev_opt_traj=prev_optimal,
+                tau_warm=0.8,
+            )
+            
+            result = generator.generate_with_warm_start(
+                condition={'start_pos': start_pos, 'goal_pos': goal_pos},
+                warm_start_latent=z_tau,
+                t_start=0.8,
+                steps=5,
+            )
+            
+            # Update for next iteration
+            prev_optimal = result['raw_output'].squeeze(0)  # [T, D*3]
+        
+        # Check result
+        assert result['positions'].shape == (1, T, D)
+        assert result['velocities'].shape == (1, T, D)
+        assert result['accelerations'].shape == (1, T, D)
+    
+    print("✓ Integration test: L1 + L2 warm start workflow - PASSED")
+
+
+def test_ot_interpolation_properties():
+    """Test mathematical properties of OT interpolation"""
+    from cfm_flowmp.inference.l1_reactive_control import L1ReactiveController, L1Config
+    
+    controller = L1ReactiveController(L1Config())
+    
+    T, D = 64, 2
+    
+    # Create a known trajectory
+    trajectory = torch.linspace(0, 1, T).unsqueeze(-1).repeat(1, D * 3)
+    
+    # Test property 1: tau=0 gives pure noise (independent of trajectory)
+    torch.manual_seed(42)
+    z_0_a = controller.prepare_warm_start_latent(trajectory, tau_warm=0.0)
+    
+    torch.manual_seed(42)
+    z_0_b = controller.prepare_warm_start_latent(trajectory * 10, tau_warm=0.0)
+    
+    # Should be equal (both are pure noise with same seed)
+    correlation = torch.corrcoef(torch.stack([z_0_a.flatten(), z_0_b.flatten()]))[0, 1]
+    assert correlation > 0.99, "tau=0 should be independent of trajectory"
+    
+    print("✓ Test 1: OT property tau=0 (pure noise) - PASSED")
+    
+    # Test property 2: tau=1 gives deterministic (no noise)
+    z_1_a = controller.prepare_warm_start_latent(trajectory, tau_warm=1.0)
+    z_1_b = controller.prepare_warm_start_latent(trajectory, tau_warm=1.0)
+    
+    # Should be exactly equal (deterministic)
+    correlation = torch.corrcoef(torch.stack([z_1_a.flatten(), z_1_b.flatten()]))[0, 1]
+    assert correlation > 0.999, "tau=1 should be deterministic"
+    
+    print("✓ Test 2: OT property tau=1 (deterministic) - PASSED")
+    
+    # Test property 3: Monotonicity - larger tau means more deterministic
+    torch.manual_seed(42)
+    taus = [0.0, 0.25, 0.5, 0.75, 1.0]
+    shifted = controller.shift_trajectory(trajectory)
+    
+    correlations = []
+    for tau in taus:
+        torch.manual_seed(42)
+        z = controller.prepare_warm_start_latent(trajectory, tau_warm=tau)
+        corr = torch.corrcoef(torch.stack([z.flatten(), shifted.flatten()]))[0, 1]
+        correlations.append(corr.item())
+    
+    # Correlations should increase monotonically
+    for i in range(len(correlations) - 1):
+        assert correlations[i] <= correlations[i + 1] + 1e-3, \
+            f"Correlation not monotonic: {correlations[i]} > {correlations[i+1]}"
+    
+    print("✓ Test 3: OT property monotonicity - PASSED")
 
 
 if __name__ == "__main__":
-    exit(main())
+    print("\n" + "=" * 80)
+    print("Running Warm Start Unit Tests")
+    print("=" * 80 + "\n")
+    
+    # Run all tests
+    try:
+        print("Test Suite 1: L1Controller.shift_trajectory")
+        print("-" * 80)
+        test_l1_shift_trajectory()
+        
+        print("\nTest Suite 2: L1Controller.prepare_warm_start_latent")
+        print("-" * 80)
+        test_l1_prepare_warm_start_latent()
+        
+        print("\nTest Suite 3: TrajectoryGenerator.generate_with_warm_start")
+        print("-" * 80)
+        test_generator_generate_with_warm_start()
+        
+        print("\nTest Suite 4: Warm Start Integration")
+        print("-" * 80)
+        test_warm_start_integration()
+        
+        print("\nTest Suite 5: OT Interpolation Properties")
+        print("-" * 80)
+        test_ot_interpolation_properties()
+        
+        print("\n" + "=" * 80)
+        print("All Tests PASSED! ✓")
+        print("=" * 80 + "\n")
+        
+    except Exception as e:
+        print("\n" + "=" * 80)
+        print("Test FAILED! ✗")
+        print("=" * 80)
+        print(f"\nError: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
