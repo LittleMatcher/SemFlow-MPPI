@@ -292,7 +292,8 @@ def main():
     
     # ============ Create a simple model for demo ============
     print("\n[1] Creating model...")
-    model = create_flowmp_transformer(variant="tiny")
+    # Use a valid predefined variant ('small', 'base', 'large')
+    model = create_flowmp_transformer(variant="small")
     model = model.to(device)
     model.eval()
     print("  ✓ Model created (random weights - for demo purposes)")
