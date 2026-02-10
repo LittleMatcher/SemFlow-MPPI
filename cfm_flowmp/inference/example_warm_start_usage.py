@@ -24,6 +24,10 @@ from typing import Dict, Optional
 from cfm_flowmp.inference.generator import TrajectoryGenerator, GeneratorConfig
 from cfm_flowmp.inference.l1_reactive_control import L1ReactiveController, L1Config
 
+# Some installations may have an earlier TrajectoryGenerator that lacks
+# the full L2 warm-start API. Detect this so examples can degrade gracefully.
+HAS_L2_WARM_START_API = hasattr(TrajectoryGenerator, "generate_with_warm_start")
+
 
 def warm_start_control_loop_example():
     """
@@ -284,48 +288,55 @@ def simple_warm_start_example():
     print(f"   Input shape:  {prev_optimal_traj.shape}")
     print(f"   Output shape: {z_tau.shape}")
     print(f"   τ_warm: {tau_warm}")
-    print(f"   Formula: z_τ = τ * shift(u*_{t-1}) + (1-τ) * ε, ε ~ N(0,I)")
+    # Textual formula; avoid undefined Python variables inside f-string
+    print("   Formula: z_τ = τ * shift(u*_(t-1)) + (1-τ) * ε, ε ~ N(0,I)")
     
     # ============ L2 Methods ============
     
-    print("\n[L2] Warm Start Methods:")
-    
-    # Create generator with mock model
-    class MockModel(torch.nn.Module):
-        def forward(self, x_t, t, **kwargs):
-            return torch.zeros_like(x_t)
-    
-    gen_config = GeneratorConfig(
-        state_dim=D,
-        seq_len=T,
-        solver_type="rk4",
-        num_steps=20,
-    )
-    generator = TrajectoryGenerator(MockModel(), gen_config)
-    
-    # 3. Generate with warm start (Refine)
-    print("\n3. generate_with_warm_start(condition, warm_start_latent, t_start, steps)")
-    
-    start_pos = torch.randn(1, D, device=device)
-    goal_pos = torch.randn(1, D, device=device)
-    
-    result = generator.generate_with_warm_start(
-        condition={
-            'start_pos': start_pos,
-            'goal_pos': goal_pos,
-        },
-        warm_start_latent=z_tau,
-        t_start=tau_warm,
-        steps=5,
-    )
-    
-    print(f"   Input (z_τ) shape: {z_tau.shape}")
-    print(f"   Output positions:  {result['positions'].shape}")
-    print(f"   Output velocities: {result['velocities'].shape}")
-    print(f"   Output accel:      {result['accelerations'].shape}")
-    print(f"   Integration range: t={tau_warm} → t=1.0")
-    print(f"   ODE steps: 5 (vs 20 for standard generation)")
-    print(f"   Speedup: ~4x")
+    # L2 warm-start part requires newer TrajectoryGenerator API
+    if HAS_L2_WARM_START_API:
+        print("\n[L2] Warm Start Methods:")
+        
+        # Create generator with mock model
+        class MockModel(torch.nn.Module):
+            def forward(self, x_t, t, **kwargs):
+                return torch.zeros_like(x_t)
+        
+        gen_config = GeneratorConfig(
+            state_dim=D,
+            seq_len=T,
+            solver_type="rk4",
+            num_steps=20,
+        )
+        generator = TrajectoryGenerator(MockModel(), gen_config)
+        
+        # 3. Generate with warm start (Refine)
+        print("\n3. generate_with_warm_start(condition, warm_start_latent, t_start, steps)")
+        
+        start_pos = torch.randn(1, D, device=device)
+        goal_pos = torch.randn(1, D, device=device)
+        
+        result = generator.generate_with_warm_start(
+            condition={
+                'start_pos': start_pos,
+                'goal_pos': goal_pos,
+            },
+            warm_start_latent=z_tau,
+            t_start=tau_warm,
+            steps=5,
+        )
+        
+        print(f"   Input (z_τ) shape: {z_tau.shape}")
+        print(f"   Output positions:  {result['positions'].shape}")
+        print(f"   Output velocities: {result['velocities'].shape}")
+        print(f"   Output accel:      {result['accelerations'].shape}")
+        print(f"   Integration range: t={tau_warm} → t=1.0")
+        print(f"   ODE steps: 5 (vs 20 for standard generation)")
+        print(f"   Speedup: ~4x")
+    else:
+        print("\n[L2] Warm Start Methods:")
+        print("   Skipped: TrajectoryGenerator in this build has no "
+              "`generate_with_warm_start` method; only L1 warm-start API is demonstrated.")
     
     print("\n" + "=" * 80)
 
@@ -444,11 +455,17 @@ if __name__ == "__main__":
     # Example 1: Simple API demonstration
     simple_warm_start_example()
     
-    # Example 2: Full control loop
-    warm_start_control_loop_example()
-    
-    # Example 3: Speedup benchmark
-    benchmark_warm_start_speedup()
+    if HAS_L2_WARM_START_API:
+        # Example 2: Full control loop
+        warm_start_control_loop_example()
+        
+        # Example 3: Speedup benchmark
+        benchmark_warm_start_speedup()
+    else:
+        print("\nNOTE: L2 warm-start examples (control loop, speed benchmark) are "
+              "skipped because `TrajectoryGenerator` in this install does not "
+              "expose the expected L2 warm-start methods. "
+              "Upgrade the library to enable full L2 warm-start demos.")
     
     print("\n" + "█" * 80)
     print("█" + " " * 78 + "█")

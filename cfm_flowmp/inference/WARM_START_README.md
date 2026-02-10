@@ -1,5 +1,35 @@
 # Warm Start (Predict-Revert-Refine) Strategy
 
+## Alternative: Zero-Shot Warm Start via Flow Inversion
+
+### 更优方案：基于流反转的零样本热启动
+
+#### 核心思想
+
+CFM 学习的是一个确定的常微分方程（ODE）：
+
+$$\frac{dx}{dt} = v_\theta(x, t)$$
+
+这意味着映射 $f: z \to x_1$ 是一个双射（Bijective）。既然我们可以从 $t=0$ 积分到 $t=1$ 生成轨迹，我们当然也可以从 $t=1$ 积分到 $t=0$ 反推噪声。
+
+#### 具体做法
+
+1. **输入**：L1 MPPI 上一帧的最优轨迹 $\mathbf{u}_{t-1}^*$（经过 Shift 操作后作为 $t=1$ 时刻的状态）
+
+2. **反向积分**：调用 ODE 求解器，时间从 $t=1$ 走向 $t=0$：
+
+   $$z^* = x_0 = \mathbf{u}_{t-1}^* + \int_{1}^{0} v_\theta(x_t, t, c) dt$$
+
+3. **输出**：直接得到生成该轨迹所需的精确噪声 $z^*$
+
+#### 优势
+
+- **速度极快**：只需要做 1 次 ODE 求解（且不需要计算梯度），计算量等同于一次常规生成
+- **数学精确**：在数值误差范围内，这个 $z^*$ 是能够重构出输入轨迹的"完美潜变量"
+- **流形约束**：如果输入的轨迹完全不符合动力学（Off-manifold），反向积分会将其"投影"回 $z$ 空间。当我们用这个 $z$ 正向生成时，得到的轨迹会自动被"修复"为符合 L2 动力学的轨迹
+
+---
+
 ## Overview
 
 The Warm Start mechanism implements a **Predict-Revert-Refine** strategy to accelerate L2 trajectory generation and ensure temporal consistency in the SemFlow-MPPI framework. This approach combines principles from:

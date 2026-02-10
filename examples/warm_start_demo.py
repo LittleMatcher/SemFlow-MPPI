@@ -67,7 +67,9 @@ def simulate_navigation_sequence(
         seq_len=64,
         state_dim=2,
         num_samples=1,
-        enable_warm_start=enable_warm_start,
+        # We will explicitly use generate_with_warm_start (Predict–Revert–Refine),
+        # so internal warm_start flag is not required here.
+        enable_warm_start=False,
         warm_start_noise_scale=0.1,
         warm_start_shift_mode="predict",
     )
@@ -80,6 +82,27 @@ def simulate_navigation_sequence(
     generation_times = []
     
     current_pos = start_pos.clone()
+    prev_optimal_traj = None  # [T, 6], used to build warm-start latent
+    
+    # Helper: build z_tau for generate_with_warm_start
+    def create_warm_start_latent(prev_traj: torch.Tensor, tau: float, noise_scale: float):
+        """
+        prev_traj: [T, 6] or [1, T, 6] full state (pos+vel+acc)
+        returns:   [T, 6] latent at t = tau
+        """
+        if prev_traj.dim() == 2:
+            traj = prev_traj.unsqueeze(0)
+        else:
+            traj = prev_traj
+        # Predict: shift trajectory forward in time
+        shifted = generator._shift_trajectory_forward(traj)  # [1, T, 6]
+        # Revert: interpolate with noise to get latent at τ
+        noise = torch.randn_like(shifted)
+        z_tau = tau * shifted + (1.0 - tau) * noise_scale * noise
+        return z_tau.squeeze(0)  # [T, 6]
+    
+    tau_warm = 0.8
+    refine_steps = 5
     
     for step in range(num_steps):
         print(f"\n{'='*60}")
@@ -98,11 +121,32 @@ def simulate_navigation_sequence(
         start_time = time.time()
         
         with torch.no_grad():
-            result = generator.generate(
-                start_pos=current_pos,
-                goal_pos=goal_pos,
-                return_raw=True,
-            )
+            # First step or no warm-start: full generation from t=0 → 1
+            if (not enable_warm_start) or prev_optimal_traj is None:
+                result = generator.generate(
+                    start_pos=current_pos,
+                    goal_pos=goal_pos,
+                    return_raw=True,
+                )
+            else:
+                # Use explicit Predict–Revert–Refine warm start:
+                # 1) Predict: shift previous optimal trajectory
+                # 2) Revert: build latent z_tau at τ
+                # 3) Refine: integrate ODE from τ → 1 with fewer steps
+                z_tau = create_warm_start_latent(
+                    prev_optimal_traj,
+                    tau=tau_warm,
+                    noise_scale=config.warm_start_noise_scale,
+                )
+                result = generator.generate_with_warm_start(
+                    condition={
+                        "start_pos": current_pos,
+                        "goal_pos": goal_pos,
+                    },
+                    warm_start_latent=z_tau,
+                    t_start=tau_warm,
+                    steps=refine_steps,
+                )
         
         generation_time = time.time() - start_time
         generation_times.append(generation_time)
@@ -113,7 +157,10 @@ def simulate_navigation_sequence(
         all_planned_trajectories.append(positions.cpu().numpy())
         
         print(f"  Generated trajectory in {generation_time*1000:.2f}ms")
-        print(f"  Warm-start active: {generator.warm_start_cache is not None}")
+        if enable_warm_start and prev_optimal_traj is not None:
+            print("  Warm-start mode: generate_with_warm_start (Refine from τ)")
+        else:
+            print("  Warm-start mode: standard generation (t=0 → 1)")
         
         # === Simulate MPPI optimization (L1) ===
         # In real deployment, L1 MPPI would:
@@ -124,10 +171,10 @@ def simulate_navigation_sequence(
         #
         # Here we simulate by just executing the planned trajectory
         
-        # Update warm-start cache with "optimal" trajectory
-        # In reality, this would be the MPPI-optimized trajectory
-        if enable_warm_start:
-            generator.update_warm_start_cache(result)
+        # In a real system, MPPI would output the optimal trajectory u*_t.
+        # Here we approximate it by using the raw model output as "optimal".
+        if "raw_output" in result:
+            prev_optimal_traj = result["raw_output"][0]  # [T, 6]
         
         # Execute one step (move along planned trajectory)
         # In reality, this would be the first control from MPPI
