@@ -698,102 +698,121 @@ def _generate_one_trajectory(traj_index: int, args_dict: Dict[str, Any]) -> Opti
     occupancy_threshold = args_dict["occupancy_threshold"]
     seed = args_dict["seed"]
     seq_len = args_dict["seq_len"]
-    base_seed = seed + traj_index + 1000
-    rng = np.random.default_rng(seed + traj_index)
 
     use_rrt = planner == "rrt"
     center_obstacles_only = args_dict.get("center_obstacles_only", use_rrt)
     rrt_num_obstacles = args_dict.get("rrt_num_obstacles", 2)
-    n_obs = rrt_num_obstacles if use_rrt else num_obstacles
+    max_scene_attempts = int(args_dict.get("max_scene_attempts", 10 if use_rrt else 4))
+    style_alpha = float(args_dict.get("rrt_style_alpha", 2.0))
 
-    obstacles = generate_random_obstacles(
-        bounds, n_obs, obstacle_type,
-        seed=base_seed,
-        center_only=center_obstacles_only,
-    )
-    cost_map = obstacles_to_cost_map(map_size, bounds, obstacles)
-    cost_map_4d = cost_map[np.newaxis, ...]
+    for attempt in range(max_scene_attempts):
+        trial_seed = seed + traj_index * 1009 + attempt
+        rng = np.random.default_rng(trial_seed)
+        base_seed = seed + traj_index + 1000 + attempt * 10000
 
-    if use_rrt:
-        fixed = args_dict.get("rrt_style_fixed")
-        if fixed is not None and len(fixed) == 2:
-            w0, w1 = float(fixed[0]), float(fixed[1])
-            s = w0 + w1
-            style = np.array([w0 / s, w1 / s], dtype=np.float32) if s > 0 else np.array([0.5, 0.5], dtype=np.float32)
-        else:
-            style = rng.dirichlet([1.0, 1.0]).astype(np.float32)
-        try:
-            start, goal = sample_start_goal_diagonal_or_opposite_edges(
-                cost_map, bounds, map_size, rng,
-                margin=0.06,
-                max_attempts=200,
-            )
-        except RuntimeError:
-            return None
-        path = plan_path_kinodynamic_rrt(
-            cost_map, start, goal, bounds, map_size,
-            style_weights=style,
-            max_velocity=args_dict.get("rrt_max_velocity", 0.8),
-            max_accel=args_dict.get("rrt_max_accel", 2.0),
-            dt=args_dict.get("rrt_dt", 0.05),
-            goal_radius=args_dict.get("rrt_goal_radius", 0.08),
-            max_iter=args_dict.get("rrt_max_iter", 2000),
-            rng=rng,
+        # 失败重试时逐步减少障碍物数量，优先保证有效样本率。
+        n_obs_base = rrt_num_obstacles if use_rrt else num_obstacles
+        n_obs = max(1, n_obs_base - (attempt // 3))
+
+        obstacles = generate_random_obstacles(
+            bounds, n_obs, obstacle_type,
+            seed=base_seed,
+            center_only=center_obstacles_only,
         )
-        if len(path) < 3:
-            return None
-    else:
-        try:
-            start, goal = sample_start_goal_in_free_space(
-                cost_map, bounds, map_size, rng,
-                margin=0.05,
-                max_attempts=200,
-            )
-        except RuntimeError:
-            return None
-        if planner == "astar":
-            path = plan_path_astar(
+        cost_map = obstacles_to_cost_map(map_size, bounds, obstacles)
+        cost_map_4d = cost_map[np.newaxis, ...]
+
+        if use_rrt:
+            fixed = args_dict.get("rrt_style_fixed")
+            if fixed is not None and len(fixed) == 2:
+                w0, w1 = float(fixed[0]), float(fixed[1])
+                s = w0 + w1
+                style = np.array([w0 / s, w1 / s], dtype=np.float32) if s > 0 else np.array([0.5, 0.5], dtype=np.float32)
+            else:
+                style = rng.dirichlet([style_alpha, style_alpha]).astype(np.float32)
+
+            try:
+                start, goal = sample_start_goal_diagonal_or_opposite_edges(
+                    cost_map, bounds, map_size, rng,
+                    margin=0.06,
+                    max_attempts=300,
+                )
+            except RuntimeError:
+                continue
+
+            # 随重试次数渐进放宽 RRT 规划超参数，提升可达率。
+            relax = float(attempt)
+            max_velocity = min(1.3, args_dict.get("rrt_max_velocity", 0.8) * (1.0 + 0.05 * relax))
+            max_accel = min(4.0, args_dict.get("rrt_max_accel", 2.0) * (1.0 + 0.10 * relax))
+            goal_radius = min(0.22, args_dict.get("rrt_goal_radius", 0.08) * (1.0 + 0.20 * relax))
+            max_iter = int(args_dict.get("rrt_max_iter", 2000) * (1.0 + 0.25 * relax))
+
+            path = plan_path_kinodynamic_rrt(
                 cost_map, start, goal, bounds, map_size,
-                occupancy_threshold=occupancy_threshold,
-            )
-        else:
-            path = plan_trajectory_mppi(
-                cost_map, start, goal, bounds, map_size,
-                horizon=args_dict["mppi_horizon"],
-                num_samples=args_dict["mppi_samples"],
-                num_iterations=args_dict["mppi_iterations"],
-                dt=args_dict["mppi_dt"],
-                control_std=args_dict["mppi_control_std"],
-                temperature=args_dict["mppi_temperature"],
-                obstacle_scale=args_dict["mppi_obstacle_scale"],
-                goal_scale=args_dict["mppi_goal_scale"],
-                control_scale=args_dict["mppi_control_scale"],
+                style_weights=style,
+                max_velocity=max_velocity,
+                max_accel=max_accel,
+                dt=args_dict.get("rrt_dt", 0.05),
+                goal_radius=goal_radius,
+                max_iter=max_iter,
                 rng=rng,
             )
-        style = rng.dirichlet([1.0, 1.0]).astype(np.float32)
+            if len(path) < 3:
+                continue
+        else:
+            try:
+                start, goal = sample_start_goal_in_free_space(
+                    cost_map, bounds, map_size, rng,
+                    margin=0.05,
+                    max_attempts=250,
+                )
+            except RuntimeError:
+                continue
 
-    traj = path_to_trajectory_with_kinematics(path, num_eval=256)
-    pos = resample_trajectory(traj[:, :2], seq_len)
-    vel = resample_trajectory(traj[:, 2:4], seq_len)
-    acc = resample_trajectory(traj[:, 4:6], seq_len)
-    acc = clip_acc_and_jerk(
-        acc,
-        max_acc=args_dict.get("max_acc"),
-        max_jerk=args_dict.get("max_jerk"),
-    )
+            if planner == "astar":
+                path = plan_path_astar(
+                    cost_map, start, goal, bounds, map_size,
+                    occupancy_threshold=occupancy_threshold,
+                )
+            else:
+                path = plan_trajectory_mppi(
+                    cost_map, start, goal, bounds, map_size,
+                    horizon=args_dict["mppi_horizon"],
+                    num_samples=args_dict["mppi_samples"],
+                    num_iterations=args_dict["mppi_iterations"],
+                    dt=args_dict["mppi_dt"],
+                    control_std=args_dict["mppi_control_std"],
+                    temperature=args_dict["mppi_temperature"],
+                    obstacle_scale=args_dict["mppi_obstacle_scale"],
+                    goal_scale=args_dict["mppi_goal_scale"],
+                    control_scale=args_dict["mppi_control_scale"],
+                    rng=rng,
+                )
+            style = rng.dirichlet([style_alpha, style_alpha]).astype(np.float32)
 
-    start_state = np.concatenate([pos[0], vel[0], acc[0]], axis=-1).astype(np.float32)
-    goal_state = np.concatenate([pos[-1], vel[-1]], axis=-1).astype(np.float32)
+        traj = path_to_trajectory_with_kinematics(path, num_eval=256)
+        pos = resample_trajectory(traj[:, :2], seq_len)
+        vel = resample_trajectory(traj[:, 2:4], seq_len)
+        acc = resample_trajectory(traj[:, 4:6], seq_len)
+        acc = clip_acc_and_jerk(
+            acc,
+            max_acc=args_dict.get("max_acc"),
+            max_jerk=args_dict.get("max_jerk"),
+        )
 
-    return {
-        "pos": pos,
-        "vel": vel,
-        "acc": acc,
-        "cost_map_4d": cost_map_4d,
-        "start_state": start_state,
-        "goal_state": goal_state,
-        "style_weights": style,
-    }
+        start_state = np.concatenate([pos[0], vel[0], acc[0]], axis=-1).astype(np.float32)
+        goal_state = np.concatenate([pos[-1], vel[-1]], axis=-1).astype(np.float32)
+
+        return {
+            "pos": pos,
+            "vel": vel,
+            "acc": acc,
+            "cost_map_4d": cost_map_4d,
+            "start_state": start_state,
+            "goal_state": goal_state,
+            "style_weights": style,
+        }
+    return None
 
 
 # 行人步行运动学参考：步行速度 ~1.2–1.4 m/s，加速度 ~0.5–1.5 m/s²，jerk ~1–2 m/s³（舒适性）
@@ -886,6 +905,10 @@ def main():
                         help="Kinematic preset: default=generic; pedestrian=walking limits (v~1.0, a~1.5, jerk~30, acc clip 3)")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="Parallel CPU workers: 0=use all cores (cpu_count()), 1=sequential, N=use N workers")
+    parser.add_argument("--max_scene_attempts", type=int, default=10,
+                        help="Max retries per trajectory with new random scenes (higher improves valid sample rate)")
+    parser.add_argument("--rrt_style_alpha", type=float, default=2.0,
+                        help="Dirichlet alpha for RRT style [w_safe,w_fast] sampling; larger => fewer extreme styles")
     parser.add_argument("--max_acc", type=float, default=None,
                         help="Clip acceleration per component to [-max_acc, max_acc] (e.g. 50.0). None=no clip.")
     parser.add_argument("--max_jerk", type=float, default=None,
@@ -933,6 +956,8 @@ def main():
         "rrt_goal_radius": getattr(args, "rrt_goal_radius", 0.08),
         "rrt_max_iter": getattr(args, "rrt_max_iter", 2000),
         "rrt_style_fixed": getattr(args, "rrt_style", None),
+        "rrt_style_alpha": getattr(args, "rrt_style_alpha", 2.0),
+        "max_scene_attempts": getattr(args, "max_scene_attempts", 10),
         "max_acc": getattr(args, "max_acc", None),
         "max_jerk": getattr(args, "max_jerk", None),
     }

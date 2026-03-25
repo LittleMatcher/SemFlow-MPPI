@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, Optional, Tuple, List, Callable
+from typing import Dict, Optional, Tuple, List, Callable, Any
 from dataclasses import dataclass
 
 from .ode_solver import RK4Solver, SolverConfig, create_solver
@@ -542,6 +542,132 @@ class TrajectoryGenerator:
         
         return warm_start_x0
 
+    @torch.no_grad()
+    def generate(
+        self,
+        start_pos: torch.Tensor,
+        goal_pos: torch.Tensor,
+        start_vel: Optional[torch.Tensor] = None,
+        goal_vel: Optional[torch.Tensor] = None,
+        env_encoding: Optional[torch.Tensor] = None,
+        num_samples: int = None,
+        return_raw: bool = False,
+        warm_start_state: Optional[torch.Tensor] = None,
+        obstacle_positions: Optional[torch.Tensor] = None,
+        cost_map: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Any]:
+        """生成轨迹（最小稳定实现，兼容 L2 推理调用路径）。"""
+        self.model.eval()
+
+        B_original = start_pos.shape[0]
+        D = self.config.state_dim
+        T = self.config.seq_len
+        device = start_pos.device
+        dtype = start_pos.dtype
+
+        num_samples = num_samples or self.config.num_samples
+
+        if num_samples > 1:
+            start_pos = start_pos.repeat(num_samples, 1)
+            goal_pos = goal_pos.repeat(num_samples, 1)
+            if start_vel is not None:
+                start_vel = start_vel.repeat(num_samples, 1)
+            if goal_vel is not None:
+                goal_vel = goal_vel.repeat(num_samples, 1)
+            if env_encoding is not None:
+                env_encoding = env_encoding.repeat(num_samples, 1)
+            B = B_original * num_samples
+        else:
+            B = B_original
+
+        if warm_start_state is not None:
+            x_0 = warm_start_state.to(device=device, dtype=dtype)
+            if x_0.dim() == 2:
+                x_0 = x_0.unsqueeze(0)
+            if x_0.shape[0] == 1 and B > 1:
+                x_0 = x_0.repeat(B, 1, 1)
+            elif x_0.shape[0] == B_original and B > B_original:
+                x_0 = x_0.repeat_interleave(num_samples, dim=0)
+        elif self.config.enable_warm_start:
+            x_0 = self._create_warm_start_prior(B, device, dtype)
+        else:
+            x_0 = torch.randn(B, T, D * 3, device=device, dtype=dtype)
+
+        def velocity_fn(x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            return self.model(
+                x_t=x_t,
+                t=t,
+                start_pos=start_pos,
+                goal_pos=goal_pos,
+                start_vel=start_vel,
+                goal_vel=goal_vel,
+                env_encoding=env_encoding,
+            )
+
+        x_1 = self.solver.solve(velocity_fn, x_0)
+
+        positions_raw = x_1[..., :D]
+        velocities_raw = x_1[..., D:D * 2]
+        accelerations_raw = x_1[..., D * 2:D * 3]
+
+        result: Dict[str, Any] = {}
+        if self.smoother is not None:
+            smoothed = self.smoother.smooth(positions_raw, return_derivatives=True)
+            result['positions'] = smoothed['positions']
+            result['velocities'] = smoothed['velocities']
+            result['accelerations'] = smoothed['accelerations']
+        else:
+            result['positions'] = positions_raw
+            result['velocities'] = velocities_raw
+            result['accelerations'] = accelerations_raw
+
+        if return_raw:
+            result['raw_positions'] = positions_raw
+            result['raw_velocities'] = velocities_raw
+            result['raw_accelerations'] = accelerations_raw
+            result['raw_output'] = x_1
+
+        # Default protocol fields
+        default_num = int(result['positions'].shape[0])
+        default_scores = torch.ones(default_num, device=device, dtype=dtype)
+        default_weights = default_scores / default_scores.sum().clamp(min=1e-6)
+        result['proposal_scores'] = default_scores
+        result['mode_weights'] = default_weights
+        result['semantic_tags'] = ["trajectory_proposal"] * default_num
+        result['num_anchors'] = default_num
+        result['anchor_indices'] = torch.arange(default_num, device=device)
+
+        if self.config.enable_multimodal_anchors and self.anchor_selector is not None and num_samples > 1:
+            all_positions = result['positions']
+            all_velocities = result.get('velocities')
+            all_accelerations = result.get('accelerations')
+
+            anchor_result = self.anchor_selector.select_anchor_trajectories(
+                trajectories=result['positions'],
+                velocities=result.get('velocities'),
+                accelerations=result.get('accelerations'),
+            )
+
+            result.update({
+                'positions': anchor_result['anchor_trajectories'],
+                'velocities': anchor_result.get('anchor_velocities', result.get('velocities')),
+                'accelerations': anchor_result.get('anchor_accelerations', result.get('accelerations')),
+                'num_anchors': anchor_result['num_anchors'],
+                'anchor_indices': anchor_result['anchor_indices'],
+                'clustering_info': anchor_result['clustering_result'],
+                'proposal_scores': anchor_result['proposal_scores'],
+                'mode_weights': anchor_result['mode_weights'],
+                'semantic_tags': anchor_result['semantic_tags'],
+                'all_positions': all_positions,
+                'all_velocities': all_velocities,
+                'all_accelerations': all_accelerations,
+            })
+
+        if self.config.enable_warm_start and x_1 is not None:
+            self.update_warm_start_cache({'raw_output': x_1})
+
+        return result
+
 
 class MultimodalAnchorSelector:
     """
@@ -640,6 +766,7 @@ class MultimodalAnchorSelector:
             包含聚类结果的字典
         """
         N = trajectories.shape[0]
+        D = trajectories.shape[-1]
         K = min(self.config.num_anchor_clusters, N)  # 确保聚类数不超过样本数
         
         # 提取特征
@@ -719,13 +846,66 @@ class MultimodalAnchorSelector:
         """GMM 聚类实现（简化版）"""
         # 这里可以实现 EM 算法，或者回退到 K-Means
         return self._kmeans_clustering(features, K)
+
+    def _infer_semantic_tags(
+        self,
+        anchor_trajectories: torch.Tensor,
+    ) -> List[str]:
+        """
+        基于几何特征为每条锚点轨迹生成语义标签。
+
+        说明：这里使用轻量启发式标签，保证 L2 输出协议中有可消费的
+        semantic_tags 字段，后续可替换为学习式语义分类头。
+        """
+        if anchor_trajectories.numel() == 0:
+            return []
+
+        tags: List[str] = []
+        traj_np = anchor_trajectories.detach()
+
+        for traj in traj_np:
+            # traj: [T, D]
+            start = traj[0]
+            end = traj[-1]
+            delta = end - start
+
+            # Path efficiency: path_length / straight_line
+            segment = traj[1:] - traj[:-1]
+            path_length = torch.norm(segment, dim=-1).sum()
+            straight = torch.norm(delta) + 1e-6
+            efficiency_ratio = (path_length / straight).item()
+
+            lateral = delta[1].item() if traj.shape[-1] >= 2 else 0.0
+
+            # Curvature proxy from second-order finite difference
+            if traj.shape[0] >= 3:
+                second = traj[2:] - 2.0 * traj[1:-1] + traj[:-2]
+                curvature = torch.norm(second, dim=-1).mean().item()
+            else:
+                curvature = 0.0
+
+            if lateral > 0.10:
+                side_tag = "right_detour"
+            elif lateral < -0.10:
+                side_tag = "left_detour"
+            else:
+                side_tag = "center_passage"
+
+            if efficiency_ratio > 1.25 or curvature > 0.03:
+                shape_tag = "obstacle_avoidance"
+            else:
+                shape_tag = "direct_to_goal"
+
+            tags.append(f"{side_tag}|{shape_tag}")
+
+        return tags
     
     def select_anchor_trajectories(
         self,
         trajectories: torch.Tensor,
         velocities: Optional[torch.Tensor] = None,
         accelerations: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """
         选择代表性锚点轨迹
         
@@ -747,6 +927,8 @@ class MultimodalAnchorSelector:
         anchor_trajectories = []
         anchor_velocities = []
         anchor_accelerations = []
+        anchor_cluster_sizes = []
+        anchor_compactness = []
         
         for k in range(K):
             # 找到属于当前聚类的轨迹
@@ -765,6 +947,10 @@ class MultimodalAnchorSelector:
             distances = torch.norm(cluster_trajs - cluster_center.unsqueeze(0), dim=(1, 2))
             closest_idx = distances.argmin()
             representative_idx = cluster_indices[closest_idx]
+
+            # 聚类质量统计：用于 proposal score
+            anchor_cluster_sizes.append(float(cluster_mask.sum().item()))
+            anchor_compactness.append(float(distances.mean().item()))
             
             # 收集代表轨迹
             anchor_indices.append(representative_idx.item())
@@ -776,11 +962,33 @@ class MultimodalAnchorSelector:
                 anchor_accelerations.append(accelerations[representative_idx])
         
         # 构建结果
+        if len(anchor_trajectories) > 0:
+            proposal_scores = []
+            for cluster_size, compactness in zip(anchor_cluster_sizes, anchor_compactness):
+                score = cluster_size / (1.0 + compactness)
+                proposal_scores.append(score)
+
+            proposal_scores_t = torch.tensor(
+                proposal_scores,
+                device=trajectories.device,
+                dtype=trajectories.dtype,
+            )
+            score_sum = proposal_scores_t.sum().clamp(min=1e-6)
+            mode_weights = proposal_scores_t / score_sum
+            semantic_tags = self._infer_semantic_tags(torch.stack(anchor_trajectories, dim=0))
+        else:
+            proposal_scores_t = torch.empty(0, device=trajectories.device, dtype=trajectories.dtype)
+            mode_weights = torch.empty(0, device=trajectories.device, dtype=trajectories.dtype)
+            semantic_tags = []
+
         result = {
             'anchor_indices': torch.tensor(anchor_indices, device=trajectories.device),
             'anchor_trajectories': torch.stack(anchor_trajectories, dim=0) if anchor_trajectories else torch.empty(0, *trajectories.shape[1:], device=trajectories.device),
             'num_anchors': len(anchor_trajectories),
             'clustering_result': clustering_result,
+            'proposal_scores': proposal_scores_t,
+            'mode_weights': mode_weights,
+            'semantic_tags': semantic_tags,
         }
         
         if anchor_velocities:
@@ -960,7 +1168,7 @@ class MultimodalAnchorSelector:
         warm_start_state: Optional[torch.Tensor] = None,
         obstacle_positions: Optional[torch.Tensor] = None,
         cost_map: Optional[torch.Tensor] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """
         为给定条件生成轨迹
         
@@ -1121,11 +1329,34 @@ class MultimodalAnchorSelector:
             result['raw_velocities'] = velocities_raw
             result['raw_accelerations'] = accelerations_raw
             result['raw_output'] = x_1
+
+        # Default L2 protocol fields (single-mode fallback)
+        default_num = int(result['positions'].shape[0]) if 'positions' in result else 0
+        if default_num > 0:
+            default_scores = torch.ones(default_num, device=device, dtype=dtype)
+            default_weights = default_scores / default_scores.sum()
+            default_indices = torch.arange(default_num, device=device)
+            default_tags = ["trajectory_proposal"] * default_num
+        else:
+            default_scores = torch.empty(0, device=device, dtype=dtype)
+            default_weights = torch.empty(0, device=device, dtype=dtype)
+            default_indices = torch.empty(0, device=device, dtype=torch.long)
+            default_tags = []
+
+        result['proposal_scores'] = default_scores
+        result['mode_weights'] = default_weights
+        result['semantic_tags'] = default_tags
+        result['num_anchors'] = default_num
+        result['anchor_indices'] = default_indices
         
         # ============ Multimodal Anchor Selection ============
         # Step 4: Multimodal Anchor Selection
         if self.config.enable_multimodal_anchors and self.anchor_selector is not None and num_samples > 1:
             # Only perform clustering when generating multiple samples
+            all_positions = result['positions']
+            all_velocities = result.get('velocities')
+            all_accelerations = result.get('accelerations')
+
             anchor_result = self.anchor_selector.select_anchor_trajectories(
                 trajectories=result['positions'],
                 velocities=result.get('velocities'),
@@ -1141,11 +1372,14 @@ class MultimodalAnchorSelector:
                 'num_anchors': anchor_result['num_anchors'],
                 'anchor_indices': anchor_result['anchor_indices'],
                 'clustering_info': anchor_result['clustering_result'],
+                'proposal_scores': anchor_result['proposal_scores'],
+                'mode_weights': anchor_result['mode_weights'],
+                'semantic_tags': anchor_result['semantic_tags'],
                 
                 # Keep original multi-sample outputs for debugging
-                'all_positions': result['positions'] if 'all_positions' not in result else result['positions'],
-                'all_velocities': result['velocities'] if 'all_velocities' not in result else result['velocities'],
-                'all_accelerations': result['accelerations'] if 'all_accelerations' not in result else result['accelerations'],
+                'all_positions': all_positions,
+                'all_velocities': all_velocities,
+                'all_accelerations': all_accelerations,
             })
             
             # Update batch size to match number of anchors

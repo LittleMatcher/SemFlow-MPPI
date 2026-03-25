@@ -13,6 +13,11 @@ Contains:
 from .transformer import FlowMPTransformer, create_flowmp_transformer
 from .unet_1d import FlowMPUNet1D, create_flowmp_unet1d
 from .l2_safety_cfm import L2SafetyCFM, L2Config, create_l2_safety_cfm
+from .semantic_diffusion_planner import (
+    SemanticDiffusionConfig,
+    SemanticConditionedDiffusionPlanner,
+    create_semantic_diffusion_planner,
+)
 from .cost_map_encoder import (
     CostMapEncoder,
     MultiScaleCostMapEncoder,
@@ -34,6 +39,9 @@ __all__ = [
     "L2SafetyCFM",
     "L2Config",
     "create_l2_safety_cfm",
+    "SemanticDiffusionConfig",
+    "SemanticConditionedDiffusionPlanner",
+    "create_semantic_diffusion_planner",
     "CostMapEncoder",
     "MultiScaleCostMapEncoder",
     "create_cost_map_encoder",

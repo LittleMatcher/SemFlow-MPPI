@@ -29,7 +29,7 @@ L1 反应控制层 (The Reactive Legs)
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable, Any
 from dataclasses import dataclass
 
 # MPPI demo backend (@mppi_demo)
@@ -380,6 +380,9 @@ class L1ReactiveController:
         # L2 锚点（torch）以及 numpy 形式
         self.anchor_positions: Optional[torch.Tensor] = None  # [K, T, D]
         self._anchors_np: Optional[np.ndarray] = None         # [K, T, D]
+        self.proposal_scores: Optional[torch.Tensor] = None   # [K]
+        self.mode_weights: Optional[torch.Tensor] = None      # [K], sum=1
+        self.semantic_tags: List[str] = []                    # len=K
         
         # 当前规划问题的起点与终点（来自 L2 锚点）
         self._start_np: Optional[np.ndarray] = None  # (D,)
@@ -466,7 +469,7 @@ class L1ReactiveController:
     # ------------------------------------------------------------------
     def initialize_from_l2_output(
         self,
-        l2_output: Dict[str, torch.Tensor],
+        l2_output: Dict[str, Any],
     ):
         """
         从 L2 输出初始化 L1 层（接口保持与旧实现一致）。
@@ -474,6 +477,11 @@ class L1ReactiveController:
         支持的 L2 输出格式：
         - `{'trajectories': [B*N, T, D], ...}`  来自 `L2SafetyCFM.generate_trajectory_anchors`
         - `{'positions': [K, T, D] 或 [B, K, T, D], ...}` 来自 `TrajectoryGenerator.generate`
+
+        可选协议字段（若存在则消费）：
+        - `proposal_scores`: [K] 每个 proposal 的先验分数
+        - `mode_weights`: [K] 归一化权重
+        - `semantic_tags`: List[str] 每个 proposal 的语义标签
         """
         # 提取锚点位置 - 支持两种键名
         if 'trajectories' in l2_output:
@@ -502,16 +510,38 @@ class L1ReactiveController:
         K, T, D = anchor_positions.shape
         self.anchor_positions = anchor_positions
         self._anchors_np = anchor_positions.detach().cpu().numpy().astype(np.float32)
+
+        # 读取 L2 proposal 协议字段
+        proposal_scores = l2_output.get('proposal_scores', None)
+        mode_weights = l2_output.get('mode_weights', None)
+        semantic_tags = l2_output.get('semantic_tags', None)
+
+        if isinstance(proposal_scores, torch.Tensor) and proposal_scores.numel() == K:
+            self.proposal_scores = proposal_scores.to(self.device).float()
+        else:
+            self.proposal_scores = torch.ones(K, device=self.device, dtype=torch.float32)
+
+        if isinstance(mode_weights, torch.Tensor) and mode_weights.numel() == K:
+            weights = mode_weights.to(self.device).float().clamp(min=0.0)
+            self.mode_weights = weights / weights.sum().clamp(min=1e-6)
+        else:
+            self.mode_weights = self.proposal_scores / self.proposal_scores.sum().clamp(min=1e-6)
+
+        if isinstance(semantic_tags, list) and len(semantic_tags) == K:
+            self.semantic_tags = [str(tag) for tag in semantic_tags]
+        else:
+            self.semantic_tags = ["trajectory_proposal"] * K
         
         # 若时间步与配置不一致，更新 n_timesteps 以匹配 L2
         if T != self.config.n_timesteps:
             self.config.n_timesteps = T
         
-        # 根据锚点估计全局 start / goal（使用所有锚点的均值）
-        start_mean = anchor_positions[:, 0, :].mean(dim=0)   # [D]
-        goal_mean = anchor_positions[:, -1, :].mean(dim=0)   # [D]
-        self._start_np = start_mean.detach().cpu().numpy().astype(np.float32)
-        self._goal_np = goal_mean.detach().cpu().numpy().astype(np.float32)
+        # 根据 mode_weights 估计全局 start / goal（加权均值）
+        weight_col = self.mode_weights.unsqueeze(-1)  # [K, 1]
+        start_weighted = (anchor_positions[:, 0, :] * weight_col).sum(dim=0)   # [D]
+        goal_weighted = (anchor_positions[:, -1, :] * weight_col).sum(dim=0)    # [D]
+        self._start_np = start_weighted.detach().cpu().numpy().astype(np.float32)
+        self._goal_np = goal_weighted.detach().cpu().numpy().astype(np.float32)
         
         # 重建 MPPI 代价 & 优化器（因为锚点发生变化）
         self._mppi = None
@@ -519,8 +549,9 @@ class L1ReactiveController:
         self._build_mppi_cost()
         self._ensure_mppi_created()
         
-        # 使用第一条锚点轨迹拟合 B-spline 控制点，作为 MPPI 的初始控制
-        first_anchor = anchor_positions[0].detach().cpu().numpy().astype(np.float32)  # [T, D]
+        # 使用最大 mode_weight 对应锚点初始化 B-spline 控制点
+        seed_idx = int(torch.argmax(self.mode_weights).item()) if self.mode_weights is not None else 0
+        first_anchor = anchor_positions[seed_idx].detach().cpu().numpy().astype(np.float32)  # [T, D]
         if self._mppi is not None:
             cp = self._mppi.bspline.fit_trajectory(first_anchor)
             self._mppi.control_points = cp
@@ -529,16 +560,19 @@ class L1ReactiveController:
         self,
         n_iterations: int = 10,
         verbose: bool = False,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """
         使用 @mppi_demo 的 `MPPI_BSpline` 执行优化。
         
         Returns (与旧版尽量保持一致的键):
             - 'optimal_control': [T, D] torch.Tensor
             - 'best_control'   : [T, D] torch.Tensor
-            - 'best_mode'      : int（此处退化为 0）
+            - 'best_mode'      : int（根据 L2 的 mode_weights 选择）
             - 'best_cost'      : float
             - 'mean_cost'      : float（所有迭代 mean_cost 的平均）
+            - 'mode_weights'   : [K] torch.Tensor
+            - 'proposal_scores': [K] torch.Tensor
+            - 'semantic_tags'  : List[str]
             - 'all_controls'   : [0, T, D] 空张量（占位，避免下游代码出错）
             - 'all_costs'      : [N] numpy->torch 张量（每次迭代的 best_cost 历史）
         """
@@ -578,9 +612,12 @@ class L1ReactiveController:
         result = {
             'optimal_control': optimal_control,          # [T, D]
             'best_control': optimal_control.clone(),     # 与 optimal 相同
-            'best_mode': 0,                              # 单一 MPPI 实例，模式退化为 0
+            'best_mode': int(torch.argmax(self.mode_weights).item()) if self.mode_weights is not None else 0,
             'best_cost': best_cost,
             'mean_cost': mean_cost,
+            'mode_weights': self.mode_weights.clone() if self.mode_weights is not None else torch.empty(0, device=self.device),
+            'proposal_scores': self.proposal_scores.clone() if self.proposal_scores is not None else torch.empty(0, device=self.device),
+            'semantic_tags': list(self.semantic_tags),
             'all_controls': torch.zeros(                 # 占位张量，防止下游 KeyError
                 0,
                 self.config.n_timesteps,

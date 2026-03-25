@@ -16,7 +16,7 @@ Key Features:
 
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 from dataclasses import dataclass
 
 from .transformer import FlowMPTransformer
@@ -212,10 +212,10 @@ class L2SafetyCFM(nn.Module):
             cbf_alpha=1.0,
             
             # 启用多模态锚点生成
-            enable_multimodal_anchors=True,
+            enable_multimodal_anchors=config.enable_multimodal_anchors,
             multimodal_batch_size=config.num_trajectory_samples,
-            num_anchor_clusters=min(8, config.num_trajectory_samples // 8),  # 自适应聚类数
-            clustering_method="kmeans",
+            num_anchor_clusters=config.num_anchor_clusters,
+            clustering_method=config.multimodal_clustering_method,
             clustering_features="midpoint",
         )
         self.generator = TrajectoryGenerator(
@@ -316,7 +316,7 @@ class L2SafetyCFM(nn.Module):
         x_goal: torch.Tensor,
         w_style: Optional[torch.Tensor] = None,
         num_samples: Optional[int] = None,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         """
         Generate multi-modal trajectory anchors for L1 MPPI.
         
@@ -386,6 +386,11 @@ class L2SafetyCFM(nn.Module):
                 result['accelerations']
             ], dim=-1),  # [B*N, T, state_dim*3] = [p, v, a]
             'num_samples_per_batch': num_samples or self.config.num_trajectory_samples,
+            'proposal_scores': result.get('proposal_scores'),
+            'mode_weights': result.get('mode_weights'),
+            'semantic_tags': result.get('semantic_tags', []),
+            'anchor_indices': result.get('anchor_indices'),
+            'num_anchors': result.get('num_anchors', result['positions'].shape[0]),
         }
         
         return output
