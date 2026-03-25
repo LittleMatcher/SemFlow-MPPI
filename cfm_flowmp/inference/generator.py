@@ -81,6 +81,111 @@ class GeneratorConfig:
 DEFAULT_8STEP_SCHEDULE = [0.0, 0.8, 0.85, 0.9, 0.92, 0.94, 0.96, 0.98, 1.0]
 
 
+def compute_proposal_scores_from_trajectories(
+    trajectories: torch.Tensor,
+    velocities: torch.Tensor,
+    accelerations: torch.Tensor,
+    method: str = "smoothness",
+) -> torch.Tensor:
+    """
+    从生成的轨迹中提取向量场置信度指标
+    
+    用法：用该函数替代uniform default_scores，使proposal质量能够被识别
+    
+    参数:
+        trajectories: 位置轨迹 [B*N, T, 2]
+        velocities: 速度分量 [B*N, T, 2]
+        accelerations: 加速度分量 [B*N, T, 2]
+        method: 置信度计算方法
+            - "smoothness": 轨迹平滑性（低加加速度=高置信）
+            - "consistency": 物理一致性（速度-位置差分 的一致性）
+            - "norm_mean": 加速度强度平均值
+            - "combined": 上述方法的加权组合
+    
+    返回:
+        proposal_scores: [B*N] 置信度分数，范围[0.1, 1.0]（越高越好）
+        
+    物理含义:
+        - 高的CFM向量场质量 → 生成平滑、物理一致的轨迹
+        - 低的向量场质量 → 轨迹抖动、加加速度大
+        置信度指标捕捉这种差异
+    """
+    B_N, T, D = trajectories.shape
+    device = trajectories.device
+    dtype = trajectories.dtype
+    
+    if method == "smoothness":
+        # 方法1: 加加速度（Jerk）的低值表示高置信度
+        # 物理意义：CFM学到的向量场质量好 → 生成平滑轨迹 → jerk低
+        # 计算jerk：d(acceleration)/dt
+        if T >= 3:
+            jerk = torch.diff(accelerations, dim=1)  # [B*N, T-1, 2]
+            jerk_norm = torch.norm(jerk, dim=-1)  # [B*N, T-1]
+            # 低jerk → 高置信度：使用 1/(1+jerk)
+            jerk_mean = jerk_norm.mean(dim=-1)  # [B*N]
+            scores = 1.0 / (1.0 + jerk_mean)  # [B*N], 范围 (0, 1]
+        else:
+            # T太小，无法计算jerk，回退到加速度范数
+            acc_norm = torch.norm(accelerations, dim=-1)  # [B*N, T]
+            acc_mean = acc_norm.mean(dim=-1)  # [B*N]
+            scores = 1.0 / (1.0 + acc_mean)
+    
+    elif method == "consistency":
+        # 方法2: 物理一致性
+        # 物理关系：v_t = v_{t-1} + a*dt
+        # 高质量向量场 → 速度与加速度高度一致
+        vel_diff = torch.norm(torch.diff(velocities, dim=1), dim=-1)  # [B*N, T-1]
+        acc_mul_dt = torch.norm(accelerations[:, :-1, :], dim=-1)  # [B*N, T-1]
+        consistency_error = torch.abs(vel_diff - acc_mul_dt).mean(dim=-1)  # [B*N]
+        # 低error → 高置信度
+        scores = 1.0 / (1.0 + consistency_error)
+    
+    elif method == "norm_mean":
+        # 方法3: 加速度强度平均值
+        # 高质量向量场 → 运动加速度强度稳定
+        acc_norm = torch.norm(accelerations, dim=-1)  # [B*N, T]
+        acc_mean = acc_norm.mean(dim=-1)  # [B*N]
+        # 标准化到 (0, 1]
+        acc_min = acc_mean.min()
+        acc_max = acc_mean.max()
+        if (acc_max - acc_min) > 1e-6:
+            scores = (acc_max - acc_mean) / (acc_max - acc_min + 1e-8)
+        else:
+            scores = torch.ones_like(acc_mean) * 0.5
+    
+    elif method == "combined":
+        # 方法4: 上述方法的加权组合
+        # 这是最健壮的方法
+        if T >= 3:
+            # 平滑性置信度
+            jerk = torch.diff(accelerations, dim=1)  # [B*N, T-1, 2]
+            jerk_norm = torch.norm(jerk, dim=-1)  # [B*N, T-1]
+            jerk_mean = jerk_norm.mean(dim=-1)  # [B*N]
+            smooth_score = 1.0 / (1.0 + jerk_mean)
+            
+            # 一致性置信度
+            vel_diff = torch.norm(torch.diff(velocities, dim=1), dim=-1)  # [B*N, T-1]
+            acc_mul_dt = torch.norm(accelerations[:, :-1, :], dim=-1)  # [B*N, T-1]
+            consistency_error = torch.abs(vel_diff - acc_mul_dt).mean(dim=-1)  # [B*N]
+            consistency_score = 1.0 / (1.0 + consistency_error)
+            
+            # 加权平均：平滑性权重更高（70%）因为与CFM loss更相关
+            scores = 0.7 * smooth_score + 0.3 * consistency_score
+        else:
+            # 如果轨迹太短，使用加速度范数
+            acc_norm = torch.norm(accelerations, dim=-1)  # [B*N, T]
+            acc_mean = acc_norm.mean(dim=-1)  # [B*N]
+            scores = 1.0 / (1.0 + acc_mean)
+    
+    else:
+        raise ValueError(f"Unknown method: {method}")
+    
+    # 确保分数在 [0.1, 1.0] 范围内（避免完全零）
+    scores = torch.clamp(scores, min=0.1, max=1.0)
+    
+    return scores
+
+
 def explicit_safety_filter(
     x: torch.Tensor,
     v_ref: torch.Tensor,
@@ -627,11 +732,21 @@ class TrajectoryGenerator:
             result['raw_accelerations'] = accelerations_raw
             result['raw_output'] = x_1
 
-        # Default protocol fields
+        # Protocol fields: 改进的proposal_scores计算（Fix1）
+        # 从生成的轨迹物理特性推断向量场质量
+        # 这使得高质量的CFM向量场能够被下游proposal选择识别
         default_num = int(result['positions'].shape[0])
-        default_scores = torch.ones(default_num, device=device, dtype=dtype)
-        default_weights = default_scores / default_scores.sum().clamp(min=1e-6)
-        result['proposal_scores'] = default_scores
+        
+        # 从轨迹质量推断向量场置信度（替代uniform default_scores）
+        proposal_scores = compute_proposal_scores_from_trajectories(
+            trajectories=result['positions'],
+            velocities=result['velocities'],
+            accelerations=result['accelerations'],
+            method="combined",  # 使用最健壮的组合方法
+        )
+        
+        default_weights = proposal_scores / proposal_scores.sum().clamp(min=1e-6)
+        result['proposal_scores'] = proposal_scores  # ← 改进：基于轨迹质量而非uniform
         result['mode_weights'] = default_weights
         result['semantic_tags'] = ["trajectory_proposal"] * default_num
         result['num_anchors'] = default_num
